@@ -159,10 +159,9 @@ export default function App() {
 
   // ── Session start ───────────────────────────────────────────────────────────
   const handleStart = useCallback(async () => {
-    const gate = assertMediaReady();
-    if (!gate.videoOk || !gate.audioOk) {
-      return;
-    }
+    // Re-check tracks but don't block — mic may not be "live" yet on mobile at the
+    // exact moment of tap. We proceed regardless; audio will work once tracks settle.
+    assertMediaReady();
     if (!audioCtxRef.current) {
       audioCtxRef.current = new AudioContext();
     }
