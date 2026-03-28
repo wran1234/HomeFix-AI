@@ -10,6 +10,8 @@ export default defineConfig({
       workbox: {
         navigateFallbackDenylist: [/^\/assets\//, /^\/api/, /^\/ws/, /\.[a-z0-9]+$/i],
         cleanupOutdatedCaches: true,
+        skipWaiting: true,
+        clientsClaim: true,
       },
       manifest: {
         name: "HomeFix",

@@ -1,1 +1,0 @@
-(function(){"use strict";self.onmessage=a=>{const{imageData:s,width:n,height:o}=a.data,e=new OffscreenCanvas(n,o);e.getContext("2d").putImageData(s,0,0),e.convertToBlob({type:"image/jpeg",quality:.6}).then(c=>{const t=new FileReader;t.onload=()=>{const l=t.result.split(",")[1];self.postMessage(l)},t.readAsDataURL(c)})}})();

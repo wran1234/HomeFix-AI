@@ -28,7 +28,13 @@ logger = logging.getLogger(__name__)
 
 
 async def _wait_for_client_ready(queue: asyncio.Queue) -> None:
-    """Block until {"type":"ready"} or keep buffering location messages (Python 3.10–compatible)."""
+    """Block until {"type":"ready"} while preserving early media (Python 3.10–compatible).
+
+    Frames/audio used to be dropped here if they arrived before `ready` was dequeued
+    (e.g. fast Begin + WS ordering). Re-inject them in order after `ready` so Gemini still
+    receives video for the vision phase.
+    """
+    deferred: list[dict] = []
     while True:
         try:
             msg = await asyncio.wait_for(queue.get(), timeout=5.0)
@@ -36,9 +42,13 @@ async def _wait_for_client_ready(queue: asyncio.Queue) -> None:
             continue
         t = msg.get("type")
         if t == "ready":
+            for m in deferred:
+                queue.put_nowait(m)
             break
         if t == "location":
             queue.put_nowait(msg)
+        elif t in ("frame", "audio", "interrupt"):
+            deferred.append(msg)
 
 # Multimodal Live: JPEG frames + 16 kHz mic PCM in; native audio (+ tool JSON) out.
 GEMINI_LIVE_MODEL = "gemini-2.0-flash-live-001"

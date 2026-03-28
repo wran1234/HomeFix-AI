@@ -2,7 +2,6 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AppPhase,
   BBox,
-  LiveDebugSnapshot,
   SeverityData,
   StepData,
   ToolsList,
@@ -20,7 +19,7 @@ import { GuideScreen } from "./screens/GuideScreen";
 import { VerifyScreen } from "./screens/VerifyScreen";
 import { ProScreen } from "./screens/ProScreen";
 import { DoneScreen } from "./screens/DoneScreen";
-import { LiveDebugPanel } from "./components/LiveDebugPanel";
+
 
 export default function App() {
   const sessionId = useMemo(() => createSessionId(), []);
@@ -33,7 +32,6 @@ export default function App() {
   const [nycChip, setNycChip] = useState<string | null>(null);
   const [nycContext, setNycContext] = useState<string | null>(null);
   const [isSpeaking, setIsSpeaking] = useState(false);
-  const [liveDebug, setLiveDebug] = useState<LiveDebugSnapshot | null>(null);
   /** Bumps on “Begin session” so the camera runs `.play()` again (fixes black video on prod Safari/WebKit). */
   const [cameraPlayNonce, setCameraPlayNonce] = useState(0);
 
@@ -100,14 +98,9 @@ export default function App() {
         console.warn("HomeFix error:", msg.code, msg.message);
         break;
       case "debug_live":
-        setLiveDebug(msg);
         break;
     }
   }, [playAudio]);
-
-  useEffect(() => {
-    if (phase === "landing") setLiveDebug(null);
-  }, [phase]);
 
   const { send, connectionBanner, isConnected } = useWebSocket(sessionId, handleMessage, sessionActive);
 
@@ -184,15 +177,6 @@ export default function App() {
     send({ type: "interrupt", text: "I understand the risk. Please guide me anyway." });
     setPhase("loading_guidance");
   }, [send]);
-
-  const showLiveDebugPanel = [
-    "identifying",
-    "loading_guidance",
-    "guiding",
-    "verifying",
-    "verified",
-    "escalate",
-  ].includes(phase);
 
   // ── Render ──────────────────────────────────────────────────────────────────
   return (
@@ -292,8 +276,6 @@ export default function App() {
         />
       )}
 
-      {/* LiveDebugPanel hidden in production — remove comment to re-enable for debugging */}
-      {/* {showLiveDebugPanel && <LiveDebugPanel data={liveDebug} />} */}
     </div>
   );
 }
