@@ -4,6 +4,9 @@ import os
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
+
+load_dotenv()
+
 from fastapi import FastAPI, HTTPException, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -11,8 +14,6 @@ from fastapi.staticfiles import StaticFiles
 
 import ws_handler
 from agents.nyc311 import fetch_landing_insights
-
-load_dotenv()
 
 
 @asynccontextmanager
@@ -49,7 +50,7 @@ async def nyc_insights(zip: str = "10001"):
     return await fetch_landing_insights(zip)
 
 
-frontend_dist = os.path.join(os.path.dirname(__file__), "..", "frontend", "dist")
+frontend_dist = os.path.join(os.path.dirname(__file__), "frontend", "dist")
 _icon_path = os.path.join(frontend_dist, "icon.svg")
 
 

@@ -1,20 +1,15 @@
-"""
-WebSocket ↔ Gemini Live API bridge.
-
-Architecture:
-  Browser → WS → FastAPI handler → asyncio.Queue (raw messages)
-                                         ↓
-                                   bridge_coroutine (per session)
-                                         ↓
-                              Gemini Live API session (active phase)
-                                         ↓
-                              Server → Client WS messages
-"""
+"""Phone camera + mic → WebSocket → Gemini Live (gemini-live-2.5-flash-native-audio) → spoken guidance for home repairs."""
 
 import asyncio
 import base64
+import binascii
 import json
+import logging
 import os
+import time
+import traceback
+from contextlib import asynccontextmanager
+
 from fastapi import WebSocket, WebSocketDisconnect
 from google import genai
 from google.genai import types
@@ -26,17 +21,184 @@ from agents.prompts import (
     VERIFICATION_SYSTEM_PROMPT,
     PRO_ESCALATION_PROMPT,
 )
-from agents.nyc311 import fetch_311_context
 from agents.grounding import fetch_repair_procedure
+from agents.nyc311 import fetch_311_context
 
-GEMINI_LIVE_MODEL = "gemini-2.0-flash-live-001"
-GEMINI_MODEL = "gemini-2.0-flash"
+logger = logging.getLogger(__name__)
+
+
+async def _wait_for_client_ready(queue: asyncio.Queue) -> None:
+    """Block until {"type":"ready"} or keep buffering location messages (Python 3.10–compatible)."""
+    while True:
+        try:
+            msg = await asyncio.wait_for(queue.get(), timeout=5.0)
+        except asyncio.TimeoutError:
+            continue
+        t = msg.get("type")
+        if t == "ready":
+            break
+        if t == "location":
+            queue.put_nowait(msg)
+
+# Multimodal Live: JPEG frames + 16 kHz mic PCM in; native audio (+ tool JSON) out.
+GEMINI_LIVE_MODEL = "gemini-2.5-flash-native-audio-latest"
+GEMINI_MODEL = "gemini-2.0-flash-001"
 BBOX_HISTORY_MAX = 5
-# Gemini Live mic input: raw little-endian PCM (see send_realtime_input audio=...)
 MIC_PCM_MIME = "audio/pcm;rate=16000"
 
 
+def _live_config(*, system_instruction: str, tools: list[types.Tool] | None = None) -> types.LiveConnectConfig:
+    # TEXT is required for function/tool signaling on Live; AUDIO for spoken output.
+    return types.LiveConnectConfig(
+        response_modalities=["AUDIO", "TEXT"],
+        system_instruction=system_instruction,
+        tools=tools,
+    )
+
+
+@asynccontextmanager
+async def _live_session(
+    client: genai.Client, config: types.LiveConnectConfig, state: session_store.SessionState
+):
+    state.live_debug.live_socket_open = True
+    try:
+        async with client.aio.live.connect(model=GEMINI_LIVE_MODEL, config=config) as live:
+            logger.info("Live session: %s", GEMINI_LIVE_MODEL)
+            yield live
+    finally:
+        state.live_debug.live_socket_open = False
+
+
+def _live_debug_touch_client_in(state: session_store.SessionState, msg: dict) -> None:
+    d = state.live_debug
+    t = msg.get("type")
+    now = time.time()
+    if t == "frame":
+        d.client_frames_in += 1
+        d.last_client_frame_ts = now
+    elif t == "audio":
+        d.client_audio_chunks_in += 1
+        d.last_client_audio_ts = now
+    elif t == "ready":
+        d.saw_ready = True
+
+
+def _live_debug_note_gemini_send_ok(state: session_store.SessionState, kind: str) -> None:
+    d = state.live_debug
+    now = time.time()
+    if kind == "video":
+        d.gemini_video_sends += 1
+        d.last_gemini_video_send_ts = now
+    elif kind == "audio":
+        d.gemini_audio_sends += 1
+        d.last_gemini_audio_send_ts = now
+
+
+def _live_debug_note_gemini_send_err(state: session_store.SessionState, err: BaseException) -> None:
+    d = state.live_debug
+    d.gemini_send_errors += 1
+    d.last_gemini_send_error = str(err)[:400]
+
+
+def _live_debug_note_gemini_out_audio(state: session_store.SessionState, nbytes: int) -> None:
+    d = state.live_debug
+    d.gemini_audio_out_chunks += 1
+    d.gemini_audio_out_bytes += nbytes
+    d.last_gemini_audio_out_ts = time.time()
+
+
+def _live_debug_note_tool(state: session_store.SessionState) -> None:
+    d = state.live_debug
+    d.gemini_tool_events += 1
+    d.last_gemini_tool_ts = time.time()
+
+
+# ── Function declarations (used instead of inline JSON for phase transitions) ─
+
+IDENTIFY_TOOL = types.FunctionDeclaration(
+    name="identify_problem",
+    description="Call this when you have clearly identified the home repair problem from the camera feed.",
+    parameters=types.Schema(
+        type="OBJECT",
+        properties={
+            "issue": types.Schema(type="STRING", description="Brief description of the problem"),
+            "severity": types.Schema(type="STRING", enum=["LOW", "MEDIUM", "HIGH"]),
+            "diy_safe": types.Schema(type="BOOLEAN", description="True if safe for DIY repair"),
+            "reason": types.Schema(type="STRING", description="Why DIY is safe or not"),
+            "findings": types.Schema(type="ARRAY", items=types.Schema(type="STRING"), description="Specific observations"),
+        },
+        required=["issue", "severity", "diy_safe", "reason", "findings"],
+    ),
+)
+
+EMIT_TOOLS_LIST = types.FunctionDeclaration(
+    name="emit_tools_list",
+    description="Call this to tell the user what tools and materials they need before starting the repair.",
+    parameters=types.Schema(
+        type="OBJECT",
+        properties={
+            "tools": types.Schema(type="ARRAY", items=types.Schema(type="STRING")),
+            "materials": types.Schema(type="ARRAY", items=types.Schema(type="STRING")),
+            "summary": types.Schema(type="STRING", description="One sentence describing what we're about to do"),
+        },
+        required=["tools", "materials", "summary"],
+    ),
+)
+
+EMIT_STEP = types.FunctionDeclaration(
+    name="emit_step",
+    description="Call this for each repair step to update the on-screen step card.",
+    parameters=types.Schema(
+        type="OBJECT",
+        properties={
+            "n": types.Schema(type="INTEGER", description="Step number"),
+            "total": types.Schema(type="INTEGER", description="Total number of steps"),
+            "title": types.Schema(type="STRING", description="Short step title"),
+            "body": types.Schema(type="STRING", description="Detailed instruction"),
+            "tools": types.Schema(type="ARRAY", items=types.Schema(type="STRING")),
+            "component": types.Schema(type="STRING", description="The specific part or area to focus the camera on"),
+        },
+        required=["n", "total", "title", "body", "tools", "component"],
+    ),
+)
+
+GUIDANCE_COMPLETE = types.FunctionDeclaration(
+    name="guidance_complete",
+    description="Call this when all repair steps have been completed and it is time to verify the repair.",
+    parameters=types.Schema(type="OBJECT", properties={}, required=[]),
+)
+
+VERIFY_REPAIR = types.FunctionDeclaration(
+    name="verify_repair",
+    description="Call this to report whether the repair looks successful based on the camera feed.",
+    parameters=types.Schema(
+        type="OBJECT",
+        properties={
+            "pass_": types.Schema(type="BOOLEAN", description="True if repair looks complete"),
+            "message": types.Schema(type="STRING", description="Specific observation about what you see"),
+        },
+        required=["pass_", "message"],
+    ),
+)
+
+ESCALATE = types.FunctionDeclaration(
+    name="escalate",
+    description="Call this when the problem is too dangerous for DIY and a professional is required.",
+    parameters=types.Schema(
+        type="OBJECT",
+        properties={
+            "findings": types.Schema(type="ARRAY", items=types.Schema(type="STRING")),
+            "pro_type": types.Schema(type="STRING", description="Type of professional needed"),
+        },
+        required=["findings", "pro_type"],
+    ),
+)
+
+
 def _make_client() -> genai.Client:
+    api_key = os.getenv("GOOGLE_API_KEY", "").strip()
+    if api_key:
+        return genai.Client(api_key=api_key)
     return genai.Client(
         vertexai=True,
         project=os.getenv("GOOGLE_CLOUD_PROJECT"),
@@ -45,15 +207,15 @@ def _make_client() -> genai.Client:
 
 
 async def handle(websocket: WebSocket, session_id: str) -> None:
-    """Main WebSocket handler — one per connected client."""
     await websocket.accept()
 
     state = session_store.get_or_create(session_id)
-    raw_queue: asyncio.Queue = asyncio.Queue(maxsize=120)
+    raw_queue: asyncio.Queue = asyncio.Queue(maxsize=200)
+    stop_debug = asyncio.Event()
 
-    # Run the bridge coroutine and WS receiver concurrently
     bridge_task = asyncio.create_task(_bridge(websocket, state, raw_queue))
-    recv_task = asyncio.create_task(_receive_loop(websocket, raw_queue))
+    recv_task = asyncio.create_task(_receive_loop(websocket, raw_queue, state))
+    debug_task = asyncio.create_task(_debug_pump(websocket, state, stop_debug))
 
     try:
         done, pending = await asyncio.wait(
@@ -62,28 +224,102 @@ async def handle(websocket: WebSocket, session_id: str) -> None:
         )
         for task in pending:
             task.cancel()
-        # Re-raise any exception
         for task in done:
-            if task.exception():
+            if not task.cancelled() and task.exception():
                 raise task.exception()
     except WebSocketDisconnect:
         pass
     except Exception as e:
+        logger.error("Session %s crashed: %s\n%s", session_id, e, traceback.format_exc())
         try:
             await websocket.send_json({"type": "error", "code": "session_error", "message": str(e)})
         except Exception:
             pass
     finally:
+        stop_debug.set()
+        debug_task.cancel()
         bridge_task.cancel()
         recv_task.cancel()
+        try:
+            await debug_task
+        except asyncio.CancelledError:
+            pass
         session_store.delete(session_id)
 
 
-async def _receive_loop(websocket: WebSocket, queue: asyncio.Queue) -> None:
-    """Drain incoming WebSocket messages into the raw queue."""
+async def _debug_pump(websocket: WebSocket, state: session_store.SessionState, stop: asyncio.Event) -> None:
+    """Push Live telemetry to the client ~1 Hz for on-device debugging."""
+    while not stop.is_set():
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=1.25)
+            break
+        except asyncio.TimeoutError:
+            pass
+        d = state.live_debug
+        now = time.time()
+
+        def age_ms(ts: float) -> int | None:
+            if not ts:
+                return None
+            return max(0, int((now - ts) * 1000))
+
+        receiving_from_phone = d.client_frames_in > 0 or d.client_audio_chunks_in > 0
+        sending_to_gemini = d.gemini_video_sends > 0 or d.gemini_audio_sends > 0
+        receiving_from_gemini = d.gemini_audio_out_chunks > 0 or d.gemini_tool_events > 0
+
+        summary_parts = []
+        if not d.saw_ready:
+            summary_parts.append("No client ready signal yet (tap Begin session)")
+        elif not d.live_socket_open:
+            summary_parts.append("Vertex Live socket closed (between phases or error)")
+        elif not receiving_from_phone:
+            summary_parts.append("No frames/audio from phone on WS")
+        elif not sending_to_gemini:
+            summary_parts.append("Phone sending but nothing forwarded to Gemini (check bridge)")
+        elif not receiving_from_gemini:
+            summary_parts.append("Sending to Gemini but no audio/tool back yet")
+        else:
+            summary_parts.append("OK: bidirectional Live traffic observed")
+
+        try:
+            await _send(
+                websocket,
+                {
+                    "type": "debug_live",
+                    "model": GEMINI_LIVE_MODEL,
+                    "bridge": d.bridge_label,
+                    "live_ws_to_vertex": d.live_socket_open,
+                    "saw_client_ready": d.saw_ready,
+                    "client_frames_in": d.client_frames_in,
+                    "client_audio_chunks_in": d.client_audio_chunks_in,
+                    "ms_since_client_frame": age_ms(d.last_client_frame_ts),
+                    "ms_since_client_audio": age_ms(d.last_client_audio_ts),
+                    "gemini_jpeg_sends": d.gemini_video_sends,
+                    "gemini_audio_sends": d.gemini_audio_sends,
+                    "ms_since_gemini_jpeg_send": age_ms(d.last_gemini_video_send_ts),
+                    "ms_since_gemini_audio_send": age_ms(d.last_gemini_audio_send_ts),
+                    "gemini_audio_out_chunks": d.gemini_audio_out_chunks,
+                    "gemini_audio_out_kb": round(d.gemini_audio_out_bytes / 1024.0, 2),
+                    "ms_since_gemini_spoke": age_ms(d.last_gemini_audio_out_ts),
+                    "tool_events_from_model": d.gemini_tool_events,
+                    "ms_since_tool_event": age_ms(d.last_gemini_tool_ts),
+                    "gemini_upstream_errors": d.gemini_send_errors,
+                    "last_upstream_error": d.last_gemini_send_error or "",
+                    "receiving_from_phone": receiving_from_phone,
+                    "sending_to_gemini": sending_to_gemini,
+                    "receiving_from_gemini": receiving_from_gemini,
+                    "summary": " · ".join(summary_parts),
+                },
+            )
+        except Exception:
+            break
+
+
+async def _receive_loop(websocket: WebSocket, queue: asyncio.Queue, state: session_store.SessionState) -> None:
     async for message in websocket.iter_text():
         try:
             data = json.loads(message)
+            _live_debug_touch_client_in(state, data)
             await queue.put(data)
         except json.JSONDecodeError:
             pass
@@ -94,28 +330,90 @@ async def _bridge(
     state: session_store.SessionState,
     queue: asyncio.Queue,
 ) -> None:
-    """
-    Core bridge: reads from queue, routes to the active Gemini Live session,
-    streams responses back to the browser.
-    """
     client = _make_client()
 
+    # Build vision config immediately so we can open the Live socket NOW,
+    # in parallel with waiting for the user to tap "Begin session".
+    # This removes ~1-2 s of Gemini session startup from the perceived latency.
+    nyc_context = state.nyc_context or ""
+    vision_system_prompt = VISION_SYSTEM_PROMPT.replace("{nyc_context}", nyc_context)
+    vision_config = _live_config(
+        system_instruction=vision_system_prompt,
+        tools=[types.Tool(function_declarations=[IDENTIFY_TOOL])],
+    )
+
+    state.live_debug.bridge_label = "connecting_live+waiting_ready"
+    logger.info("Pre-connecting Gemini Live while waiting for client ready signal...")
+
+    try:
+        async with _live_session(client, vision_config, state) as live:
+            # Wait for user to tap "Begin session" (AudioContext gesture) —
+            # but the Gemini WebSocket is already open.
+            try:
+                await asyncio.wait_for(_wait_for_client_ready(queue), timeout=60.0)
+            except asyncio.TimeoutError:
+                logger.warning("No ready signal within 60s — proceeding anyway")
+
+            logger.info("Client ready — greeting immediately (Live session already open)")
+            await _send(websocket, {"type": "status", "state": "identifying"})
+
+            # Vision phase reuses the already-open Live session
+            await _run_vision_phase(client, websocket, state, queue, live=live)
+    except Exception as e:
+        logger.warning("Pre-warmed session failed (%s) — opening fresh session", e)
+        await _send(websocket, {"type": "status", "state": "identifying"})
+        await _run_vision_phase(client, websocket, state, queue)  # opens its own session
+
+    # Remaining phases each open their own session (config/tools differ per phase)
     while True:
-        # Each phase gets its own Live session
-        if state.active_phase == "vision":
-            await _run_vision_phase(client, websocket, state, queue)
-        elif state.active_phase == "guidance":
+        if state.active_phase == "guidance":
             await _run_guidance_phase(client, websocket, state, queue)
         elif state.active_phase == "verification":
             await _run_verification_phase(client, websocket, state, queue)
         elif state.active_phase == "escalate":
             await _run_escalation_phase(client, websocket, state, queue)
-            # If user overrode ("handle myself"), active_phase is now "guidance"
-            # and the loop continues. Otherwise we're done.
             if state.active_phase == "escalate":
                 break
         else:
             break
+
+
+def _text_turn(text: str) -> types.Content:
+    return types.Content(parts=[types.Part(text=text)], role="user")
+
+
+def _parse_function_call(response) -> tuple[str | None, dict, str | None]:
+    """Extract function name, args, and call id (for tool responses) from a Live message."""
+    try:
+        if hasattr(response, "tool_call") and response.tool_call:
+            for fc in response.tool_call.function_calls:
+                args = dict(fc.args) if fc.args else {}
+                fid = getattr(fc, "id", None) or None
+                return fc.name, args, fid
+        if hasattr(response, "server_content") and response.server_content:
+            sc = response.server_content
+            if hasattr(sc, "model_turn") and sc.model_turn:
+                for part in sc.model_turn.parts:
+                    if hasattr(part, "function_call") and part.function_call:
+                        fc = part.function_call
+                        args = dict(fc.args) if fc.args else {}
+                        fid = getattr(fc, "id", None) or None
+                        return fc.name, args, fid
+    except Exception:
+        pass
+    return None, {}, None
+
+
+async def _ack_tool(live_session, fn_name: str, call_id: str | None = None) -> None:
+    """Send a tool response so the model knows the call was handled."""
+    try:
+        if call_id:
+            fr = types.FunctionResponse(name=fn_name, response={"result": "ok"}, id=call_id)
+        else:
+            fr = types.FunctionResponse(name=fn_name, response={"result": "ok"})
+        await live_session.send_tool_response(function_responses=[fr])
+    except Exception:
+        pass
 
 
 async def _run_vision_phase(
@@ -123,41 +421,42 @@ async def _run_vision_phase(
     websocket: WebSocket,
     state: session_store.SessionState,
     queue: asyncio.Queue,
+    live=None,
 ) -> None:
-    """VisionAgent: 1fps camera frames → problem identification."""
-    await _send(websocket, {"type": "status", "state": "identifying"})
+    """Vision phase. If `live` is provided it reuses the pre-warmed session; otherwise opens its own."""
+    state.live_debug.bridge_label = "vision_identify"
 
-    nyc_context = state.nyc_context or ""
-    system_prompt = VISION_SYSTEM_PROMPT.replace("{nyc_context}", nyc_context)
-
-    live_config = types.LiveConnectConfig(
-        response_modalities=["AUDIO", "TEXT"],
-        system_instruction=system_prompt,
-    )
-
-    async with client.aio.live.connect(model=GEMINI_LIVE_MODEL, config=live_config) as live:
-        send_task = asyncio.create_task(_feed_frames(queue, live, state, fps=1))
+    async def _run(live_session) -> None:
+        await live_session.send_client_content(
+            turns=_text_turn("Start now: greet the user warmly and ask them to show you the problem area."),
+            turn_complete=True,
+        )
+        send_task = asyncio.create_task(_feed_frames(queue, live_session, state, fps=1))
         try:
-            async for response in live.receive():
-                # Handle audio output → relay to browser
-                if hasattr(response, "data") and response.data:
-                    audio_b64 = base64.b64encode(response.data).decode()
-                    await _send(websocket, {"type": "speech", "audio": audio_b64})
+            while True:
+                async for response in live_session.receive():
+                    if hasattr(response, "data") and response.data:
+                        _live_debug_note_gemini_out_audio(state, len(response.data))
+                        audio_b64 = base64.b64encode(response.data).decode()
+                        await _send(websocket, {"type": "speech", "audio": audio_b64})
 
-                # Handle text output → try to parse as phase JSON
-                text = _extract_text(response)
-                if text:
-                    parsed = _try_parse_json(text)
-                    if parsed and parsed.get("phase") == "identified":
+                    fn_name, args, call_id = _parse_function_call(response)
+                    if fn_name:
+                        _live_debug_note_tool(state)
+                    if fn_name == "identify_problem" and args:
+                        await _ack_tool(live_session, fn_name, call_id)
                         send_task.cancel()
-                        state.problem = parsed.get("issue", "")
-                        state.severity_json = parsed
-                        state.diy_safe = parsed.get("diy_safe", True)
 
-                        await _send(websocket, {"type": "severity", **parsed})
+                        state.problem = args.get("issue", "")
+                        state.severity_json = args
+                        state.diy_safe = args.get("diy_safe", True)
+
+                        await _send(websocket, {"type": "severity", **args})
+                        asyncio.create_task(
+                            _fetch_and_send_bbox(client, websocket, state, state.problem)
+                        )
 
                         if state.diy_safe:
-                            # Fetch grounding + switch to guidance
                             await _send(websocket, {"type": "status", "state": "loading_guidance"})
                             state.grounding_cache = await fetch_repair_procedure(state.problem)
                             state.active_phase = "guidance"
@@ -165,11 +464,21 @@ async def _run_vision_phase(
                             state.active_phase = "escalate"
                         return
 
-                # Handle NYC location message from queue (non-blocking peek)
-                await _process_location_from_queue(queue, state, websocket)
-
+                    await _process_location_from_queue(queue, state, websocket)
         finally:
             send_task.cancel()
+
+    if live is not None:
+        await _run(live)
+    else:
+        nyc_context = state.nyc_context or ""
+        system_prompt = VISION_SYSTEM_PROMPT.replace("{nyc_context}", nyc_context)
+        live_config = _live_config(
+            system_instruction=system_prompt,
+            tools=[types.Tool(function_declarations=[IDENTIFY_TOOL])],
+        )
+        async with _live_session(client, live_config, state) as fresh_live:
+            await _run(fresh_live)
 
 
 async def _run_guidance_phase(
@@ -178,7 +487,7 @@ async def _run_guidance_phase(
     state: session_store.SessionState,
     queue: asyncio.Queue,
 ) -> None:
-    """GuidanceAgent: live voice + step instructions + bbox annotations."""
+    state.live_debug.bridge_label = "guidance"
     await _send(websocket, {"type": "status", "state": "guiding"})
 
     repair_procedure = state.grounding_cache or f"Standard repair procedure for {state.problem}"
@@ -189,50 +498,51 @@ async def _run_guidance_phase(
         total_steps=state.total_steps or "several",
     )
 
-    live_config = types.LiveConnectConfig(
-        response_modalities=["AUDIO", "TEXT"],
+    live_config = _live_config(
         system_instruction=system_prompt,
+        tools=[types.Tool(function_declarations=[EMIT_TOOLS_LIST, EMIT_STEP, GUIDANCE_COMPLETE])],
     )
 
-    async with client.aio.live.connect(model=GEMINI_LIVE_MODEL, config=live_config) as live:
-        # Inject context so agent knows what to guide
+    async with _live_session(client, live_config, state) as live:
         context_msg = (
             f"The user needs help fixing: {state.problem}. "
             f"Safety context: {json.dumps(state.severity_json)}. "
-            f"Begin guiding step by step now."
+            f"Start by listing all tools and materials needed using emit_tools_list, then wait for them to say ready."
         )
-        await live.send(input=context_msg, end_of_turn=True)
+        await live.send_client_content(turns=_text_turn(context_msg), turn_complete=True)
 
         send_task = asyncio.create_task(_feed_frames(queue, live, state, fps=2))
         try:
-            async for response in live.receive():
-                if hasattr(response, "data") and response.data:
-                    audio_b64 = base64.b64encode(response.data).decode()
-                    await _send(websocket, {"type": "speech", "audio": audio_b64})
+            while True:
+                async for response in live.receive():
+                    if hasattr(response, "data") and response.data:
+                        _live_debug_note_gemini_out_audio(state, len(response.data))
+                        audio_b64 = base64.b64encode(response.data).decode()
+                        await _send(websocket, {"type": "speech", "audio": audio_b64})
 
-                text = _extract_text(response)
-                if text:
-                    parsed = _try_parse_json(text)
-                    if parsed:
-                        if parsed.get("phase") == "step":
-                            state.current_step = parsed.get("n", state.current_step)
-                            state.total_steps = parsed.get("total", state.total_steps)
-                            await _send(websocket, {"type": "step", **parsed})
+                    fn_name, args, call_id = _parse_function_call(response)
+                    if fn_name:
+                        _live_debug_note_tool(state)
+                    if fn_name == "emit_tools_list" and args:
+                        await _ack_tool(live, fn_name, call_id)
+                        await _send(websocket, {"type": "tools_list", **args})
 
-                            # Fetch bbox for this component via separate Gemini call
-                            asyncio.create_task(
-                                _fetch_and_send_bbox(
-                                    client, websocket, state, parsed.get("component", "")
-                                )
-                            )
+                    elif fn_name == "emit_step" and args:
+                        await _ack_tool(live, fn_name, call_id)
+                        state.current_step = args.get("n", state.current_step)
+                        state.total_steps = args.get("total", state.total_steps)
+                        await _send(websocket, {"type": "step", **args})
+                        asyncio.create_task(
+                            _fetch_and_send_bbox(client, websocket, state, args.get("component", ""))
+                        )
 
-                        elif parsed.get("phase") == "guidance_complete":
-                            send_task.cancel()
-                            state.repair_attempted = True
-                            state.active_phase = "verification"
-                            await _send(websocket, {"type": "status", "state": "verifying"})
-                            return
-
+                    elif fn_name == "guidance_complete":
+                        await _ack_tool(live, fn_name, call_id)
+                        send_task.cancel()
+                        state.repair_attempted = True
+                        state.active_phase = "verification"
+                        await _send(websocket, {"type": "status", "state": "verifying"})
+                        return
         finally:
             send_task.cancel()
 
@@ -243,20 +553,21 @@ async def _run_verification_phase(
     state: session_store.SessionState,
     queue: asyncio.Queue,
 ) -> None:
-    """VerificationAgent: watch 3 frames, emit pass/fail."""
+    state.live_debug.bridge_label = "verification"
     await _send(websocket, {"type": "status", "state": "verifying"})
 
     system_prompt = VERIFICATION_SYSTEM_PROMPT.format(problem=state.problem or "repair")
 
-    live_config = types.LiveConnectConfig(
-        response_modalities=["AUDIO", "TEXT"],
+    live_config = _live_config(
         system_instruction=system_prompt,
+        tools=[types.Tool(function_declarations=[VERIFY_REPAIR])],
     )
 
     frames_sent = 0
-    async with client.aio.live.connect(model=GEMINI_LIVE_MODEL, config=live_config) as live:
-        # Feed exactly 3 frames then ask for verdict
-        async with asyncio.timeout(30):
+    async with _live_session(client, live_config, state) as live:
+
+        async def _ingest_verify_frames() -> None:
+            nonlocal frames_sent
             while frames_sent < 3:
                 try:
                     msg = await asyncio.wait_for(queue.get(), timeout=5.0)
@@ -264,31 +575,45 @@ async def _run_verification_phase(
                     if t == "audio":
                         pcm = base64.b64decode(msg["data"])
                         try:
-                            await live.send_realtime_input(
-                                audio=types.Blob(data=pcm, mime_type=MIC_PCM_MIME),
-                            )
-                        except Exception:
-                            pass
+                            await live.send_realtime_input(audio=types.Blob(data=pcm, mime_type=MIC_PCM_MIME))
+                            _live_debug_note_gemini_send_ok(state, "audio")
+                        except Exception as e:
+                            _live_debug_note_gemini_send_err(state, e)
                     elif t == "frame":
                         frame_bytes = base64.b64decode(msg["data"])
-                        await live.send(
-                            input=types.Part.from_bytes(data=frame_bytes, mime_type="image/jpeg"),
-                            end_of_turn=(frames_sent == 2),
-                        )
+                        try:
+                            await live.send_realtime_input(
+                                video=types.Blob(data=frame_bytes, mime_type="image/jpeg")
+                            )
+                            _live_debug_note_gemini_send_ok(state, "video")
+                        except Exception as e:
+                            _live_debug_note_gemini_send_err(state, e)
                         frames_sent += 1
+                        if frames_sent == 3:
+                            await live.send_client_content(
+                                turns=_text_turn("I've shown you the repair area. Please assess it and call verify_repair."),
+                                turn_complete=True,
+                            )
                 except asyncio.TimeoutError:
                     break
 
-        async for response in live.receive():
-            if hasattr(response, "data") and response.data:
-                audio_b64 = base64.b64encode(response.data).decode()
-                await _send(websocket, {"type": "speech", "audio": audio_b64})
+        try:
+            await asyncio.wait_for(_ingest_verify_frames(), timeout=30.0)
+        except asyncio.TimeoutError:
+            pass
 
-            text = _extract_text(response)
-            if text:
-                parsed = _try_parse_json(text)
-                if parsed and parsed.get("phase") == "verified":
-                    await _send(websocket, {"type": "verify_result", **parsed})
+        while True:
+            async for response in live.receive():
+                if hasattr(response, "data") and response.data:
+                    audio_b64 = base64.b64encode(response.data).decode()
+                    await _send(websocket, {"type": "speech", "audio": audio_b64})
+
+                fn_name, args, call_id = _parse_function_call(response)
+                if fn_name == "verify_repair" and args:
+                    await _ack_tool(live, fn_name, call_id)
+                    # "pass_" because "pass" is a Python keyword
+                    result = {"pass": args.get("pass_", False), "message": args.get("message", "")}
+                    await _send(websocket, {"type": "verify_result", **result})
                     if state.nyc_context:
                         await _send(websocket, {"type": "nyc_context", "text": state.nyc_context})
                     return
@@ -300,7 +625,7 @@ async def _run_escalation_phase(
     state: session_store.SessionState,
     queue: asyncio.Queue,
 ) -> None:
-    """Escalation: explain why DIY is unsafe, recommend professional."""
+    state.live_debug.bridge_label = "escalation"
     await _send(websocket, {"type": "status", "state": "escalate"})
 
     findings = json.dumps(state.severity_json.get("findings", []) if state.severity_json else [])
@@ -309,48 +634,52 @@ async def _run_escalation_phase(
         findings=findings,
     )
 
-    live_config = types.LiveConnectConfig(
-        response_modalities=["AUDIO", "TEXT"],
+    live_config = _live_config(
         system_instruction=system_prompt,
+        tools=[types.Tool(function_declarations=[ESCALATE])],
     )
 
-    async with client.aio.live.connect(model=GEMINI_LIVE_MODEL, config=live_config) as live:
-        await live.send(
-            input=f"Explain why this is unsafe for DIY and what professional to call: {state.problem}",
-            end_of_turn=True,
+    async with _live_session(client, live_config, state) as live:
+        await live.send_client_content(
+            turns=_text_turn(f"Explain why this is unsafe for DIY and call escalate: {state.problem}"),
+            turn_complete=True,
         )
 
-        async for response in live.receive():
-            if hasattr(response, "data") and response.data:
-                audio_b64 = base64.b64encode(response.data).decode()
-                await _send(websocket, {"type": "speech", "audio": audio_b64})
+        escalated = False
+        while not escalated:
+            async for response in live.receive():
+                if hasattr(response, "data") and response.data:
+                    _live_debug_note_gemini_out_audio(state, len(response.data))
+                    audio_b64 = base64.b64encode(response.data).decode()
+                    await _send(websocket, {"type": "speech", "audio": audio_b64})
 
-            text = _extract_text(response)
-            if text:
-                parsed = _try_parse_json(text)
-                if parsed and parsed.get("phase") == "escalated":
-                    await _send(websocket, {"type": "escalated", **parsed})
+                fn_name, args, call_id = _parse_function_call(response)
+                if fn_name:
+                    _live_debug_note_tool(state)
+                if fn_name == "escalate" and args:
+                    await _ack_tool(live, fn_name, call_id)
+                    await _send(websocket, {"type": "escalated", **args})
+                    escalated = True
                     break
 
-    # Wait up to 60 seconds for the user to override ("I'll handle it myself")
-    # or close the session. Interrupt message → resume as guided DIY.
+    async def _wait_escalate_interrupt() -> None:
+        while True:
+            try:
+                msg = await asyncio.wait_for(queue.get(), timeout=5.0)
+            except asyncio.TimeoutError:
+                continue
+            if msg.get("type") == "interrupt":
+                state.active_phase = "guidance"
+                state.diy_safe = True
+                if not state.grounding_cache and state.problem:
+                    await _send(websocket, {"type": "status", "state": "loading_guidance"})
+                    state.grounding_cache = await fetch_repair_procedure(state.problem)
+                return
+
     try:
-        async with asyncio.timeout(60):
-            while True:
-                try:
-                    msg = await asyncio.wait_for(queue.get(), timeout=5.0)
-                except asyncio.TimeoutError:
-                    continue
-                if msg.get("type") == "interrupt":
-                    state.active_phase = "guidance"
-                    state.diy_safe = True  # user override
-                    # Fetch grounding now so guidance phase has it
-                    if not state.grounding_cache and state.problem:
-                        await _send(websocket, {"type": "status", "state": "loading_guidance"})
-                        state.grounding_cache = await fetch_repair_procedure(state.problem)
-                    return
+        await asyncio.wait_for(_wait_escalate_interrupt(), timeout=60.0)
     except asyncio.TimeoutError:
-        pass  # No override — session ends normally
+        pass
 
 
 async def _fetch_and_send_bbox(
@@ -359,49 +688,26 @@ async def _fetch_and_send_bbox(
     state: session_store.SessionState,
     component: str,
 ) -> None:
-    """
-    Bbox fallback: separate non-streaming Gemini call to get bounding box.
-    This is the reliable path — does not depend on Live text channel parsing.
-    """
     if not component or not state.bbox_history:
         return
-
-    # Use the most recent frame for bbox detection
-    last_frame_b64 = state.bbox_history[-1] if state.bbox_history else None
-    if not last_frame_b64:
-        return
-
     try:
         response = await client.aio.models.generate_content(
             model=GEMINI_MODEL,
             contents=[
-                types.Part.from_bytes(
-                    data=base64.b64decode(last_frame_b64),
-                    mime_type="image/jpeg",
-                ),
-                types.Part(
-                    text=(
-                        f"Locate '{component}' in this image. "
-                        f"Return ONLY this JSON, nothing else: "
-                        f'{{\"bbox\": [x, y, width, height], \"label\": \"{component}\"}}'
-                        f" where coordinates are 0-1 normalized (fraction of image size). "
-                        f"If not visible, return {{\"bbox\": null}}"
-                    )
-                ),
+                types.Part.from_bytes(data=base64.b64decode(state.bbox_history[-1]), mime_type="image/jpeg"),
+                types.Part(text=(
+                    f"Locate '{component}' in this image. "
+                    f'Return ONLY this JSON: {{"bbox": [x, y, width, height], "label": "{component}"}} '
+                    f"where coordinates are 0-1 normalized. If not visible: {{\"bbox\": null}}"
+                )),
             ],
             config=types.GenerateContentConfig(temperature=0.0),
         )
-
         parsed = _try_parse_json(response.text or "")
         if parsed and parsed.get("bbox"):
-            await _send(websocket, {
-                "type": "annotation",
-                "bbox": parsed["bbox"],
-                "label": component,
-                "color": "white",
-            })
+            await _send(websocket, {"type": "annotation", "bbox": parsed["bbox"], "label": component, "color": "white"})
     except Exception:
-        pass  # bbox is best-effort, never blocks the session
+        pass
 
 
 async def _feed_frames(
@@ -410,11 +716,6 @@ async def _feed_frames(
     state: session_store.SessionState,
     fps: int,
 ) -> None:
-    """
-    Pull frame messages from the queue and send to the Live session.
-    fps controls how many frames per second to forward (others are dropped).
-    """
-    import time
     interval = 1.0 / fps
     last_sent = 0.0
 
@@ -427,18 +728,20 @@ async def _feed_frames(
         t = msg.get("type")
         if t == "audio":
             pcm = base64.b64decode(msg["data"])
+            if len(pcm) < 2:
+                continue
             try:
-                await live_session.send_realtime_input(
-                    audio=types.Blob(data=pcm, mime_type=MIC_PCM_MIME),
-                )
-            except Exception:
-                pass
+                await live_session.send_realtime_input(audio=types.Blob(data=pcm, mime_type=MIC_PCM_MIME))
+                _live_debug_note_gemini_send_ok(state, "audio")
+            except Exception as e:
+                logger.debug("send_realtime_input audio failed: %s", e)
+                _live_debug_note_gemini_send_err(state, e)
 
         elif t == "interrupt":
             txt = (msg.get("text") or "").strip()
             if txt:
                 try:
-                    await live_session.send_realtime_input(text=txt)
+                    await live_session.send_client_content(turns=_text_turn(txt), turn_complete=True)
                 except Exception:
                     pass
 
@@ -446,21 +749,26 @@ async def _feed_frames(
             now = time.monotonic()
             if now - last_sent >= interval:
                 last_sent = now
-                frame_bytes = base64.b64decode(msg["data"])
                 try:
-                    await live_session.send(
-                        input=types.Part.from_bytes(data=frame_bytes, mime_type="image/jpeg"),
-                        end_of_turn=False,
+                    frame_bytes = base64.b64decode(msg["data"], validate=True)
+                except (ValueError, binascii.Error):
+                    continue
+                if len(frame_bytes) < 100:
+                    continue
+                try:
+                    # Vertex Live: JPEG frames go on the video stream (see Gen AI SDK + Live API input specs).
+                    await live_session.send_realtime_input(
+                        video=types.Blob(data=frame_bytes, mime_type="image/jpeg")
                     )
-                    b64 = msg["data"]
-                    state.bbox_history.append(b64)
+                    _live_debug_note_gemini_send_ok(state, "video")
+                    state.bbox_history.append(msg["data"])
                     if len(state.bbox_history) > BBOX_HISTORY_MAX:
                         state.bbox_history.pop(0)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("send_realtime_input video frame failed: %s", e)
+                    _live_debug_note_gemini_send_err(state, e)
 
         elif t == "location":
-            # Re-queue for _process_location_from_queue only if context not yet fetched
             if not state.nyc_context:
                 queue.put_nowait(msg)
 
@@ -470,7 +778,6 @@ async def _process_location_from_queue(
     state: session_store.SessionState,
     websocket: WebSocket,
 ) -> None:
-    """Non-blocking: check if a location message is at the front of the queue."""
     if state.nyc_context:
         return
     try:
@@ -483,32 +790,13 @@ async def _process_location_from_queue(
                     state.nyc_context = context
                     await _send(websocket, {"type": "nyc_chip", "text": context})
         else:
-            # Not a location message — put back
             await queue.put(msg)
     except asyncio.QueueEmpty:
         pass
 
 
-def _extract_text(response) -> str:
-    """Extract text content from a Gemini Live response."""
-    try:
-        if hasattr(response, "text") and response.text:
-            return response.text
-        if hasattr(response, "server_content") and response.server_content:
-            sc = response.server_content
-            if hasattr(sc, "model_turn") and sc.model_turn:
-                for part in sc.model_turn.parts:
-                    if hasattr(part, "text") and part.text:
-                        return part.text
-    except Exception:
-        pass
-    return ""
-
-
 def _try_parse_json(text: str) -> dict | None:
-    """Try to parse JSON from text. Silent failure — returns None if not valid JSON."""
     text = text.strip()
-    # Find JSON object in text (model may wrap it in prose)
     start = text.find("{")
     end = text.rfind("}") + 1
     if start == -1 or end == 0:
@@ -520,7 +808,6 @@ def _try_parse_json(text: str) -> dict | None:
 
 
 async def _send(websocket: WebSocket, data: dict) -> None:
-    """Safe WebSocket send — swallows errors on closed connections."""
     try:
         await websocket.send_json(data)
     except Exception:

@@ -10,7 +10,20 @@
       "Bash(pip install:*)",
       "Bash(python:*)",
       "Bash(python3:*)",
-      "Bash(ls /Users/williamran/Desktop/NYCHackathon/*.md)"
+      "Bash(ls /Users/williamran/Desktop/NYCHackathon/*.md)",
+      "Bash(gcloud auth:*)",
+      "Bash(1 echo:*)",
+      "Bash(gcloud projects:*)",
+      "Bash(gcloud config:*)",
+      "Bash(cp:*)",
+      "Bash(mkdir:*)",
+      "Bash(gcloud run:*)",
+      "Bash(gcloud builds:*)",
+      "Bash(gcloud logging:*)",
+      "Bash(grep -v \"^$\")",
+      "Bash(pip show:*)",
+      "Bash(cd:*)",
+      "Bash(npm run:*)"
     ]
   }
 }

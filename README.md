@@ -35,7 +35,7 @@ Run commands from the **`backend/`** directory (so `main` resolves).
 ```bash
 cd backend
 cp .env.example .env
-# Set GOOGLE_CLOUD_PROJECT to your real GCP project ID (not the placeholder).
+# Set GOOGLE_CLOUD_PROJECT (this repo uses `homefix-ai-491603` for Cloud Run / Vertex).
 
 pip install -r requirements.txt
 uvicorn main:app --reload --host 0.0.0.0 --port 8080
@@ -118,7 +118,7 @@ gcloud run deploy homefix-ai \
   --region us-central1 \
   --allow-unauthenticated \
   --min-instances 1 \
-  --set-env-vars GOOGLE_CLOUD_PROJECT=your-project-id \
+  --set-env-vars GOOGLE_CLOUD_PROJECT=homefix-ai-491603 \
   --port 8080
 ```
 

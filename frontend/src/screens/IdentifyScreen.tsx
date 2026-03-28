@@ -1,9 +1,10 @@
+import type { Ref } from "react";
 import { BBox } from "../types";
 import { CanvasOverlay } from "../components/CanvasOverlay";
 import { VoiceWaveform } from "../components/VoiceWaveform";
 
 interface Props {
-  videoRef: React.RefObject<HTMLVideoElement>;
+  videoRef: Ref<HTMLVideoElement>;
   bbox: BBox | null;
   isSpeaking: boolean;
   nycChip: string | null;
@@ -24,8 +25,16 @@ export function IdentifyScreen({ videoRef, bbox, isSpeaking, nycChip, status }: 
       </header>
 
       <div className="hf-camera">
-        <video ref={videoRef} autoPlay playsInline muted />
-        <CanvasOverlay bbox={bbox} width={640} height={480} />
+        <video
+          ref={videoRef}
+          className="hf-camera-feed"
+          autoPlay
+          playsInline
+          muted
+          controls={false}
+          disablePictureInPicture
+        />
+        <CanvasOverlay bbox={bbox} />
       </div>
 
       <div className="hf-panel">
@@ -39,11 +48,19 @@ export function IdentifyScreen({ videoRef, bbox, isSpeaking, nycChip, status }: 
           <span className="hf-status-text">
             {loadingGuidance
               ? "Reviewing repair context…"
-              : "Looking at your space — take your time."}
+              : isSpeaking
+              ? "Listening…"
+              : "Point your camera at the problem — you can speak at any time."}
           </span>
         </div>
 
         <VoiceWaveform isActive={isSpeaking} label="Assistant audio" />
+
+        {!loadingGuidance && !isSpeaking && (
+          <p className="hf-identify__hint">
+            The assistant will guide you. Speak naturally to ask questions.
+          </p>
+        )}
 
         {nycChip && (
           <div className="hf-chip-context">

@@ -32,7 +32,7 @@ if env_path.exists():
 from google import genai
 from google.genai import types
 
-GEMINI_LIVE_MODEL = "gemini-2.0-flash-live-001"
+GEMINI_LIVE_MODEL = "gemini-live-2.5-flash-native-audio"
 
 # Minimal 1x1 white JPEG (valid JPEG for testing)
 TINY_JPEG_B64 = (
@@ -86,9 +86,9 @@ async def run_test():
             )
             print("Frame sent. Waiting for text response (10s timeout)...")
 
-            async with asyncio.timeout(10):
+            async def _read_turn() -> None:
+                nonlocal json_received
                 async for response in live.receive():
-                    # Try to get text
                     text = ""
                     if hasattr(response, "text") and response.text:
                         text = response.text
@@ -103,7 +103,6 @@ async def run_test():
                     if text:
                         text_received.append(text)
                         print(f"  Text received: {text!r}")
-                        # Try JSON parse
                         stripped = text.strip()
                         start = stripped.find("{")
                         end = stripped.rfind("}") + 1
@@ -117,11 +116,12 @@ async def run_test():
                             except json.JSONDecodeError:
                                 pass
 
-                    # Check if turn is complete
                     if hasattr(response, "server_content") and response.server_content:
                         sc = response.server_content
                         if getattr(sc, "turn_complete", False):
                             break
+
+            await asyncio.wait_for(_read_turn(), timeout=10.0)
 
     except asyncio.TimeoutError:
         print("  (timed out waiting for response)")

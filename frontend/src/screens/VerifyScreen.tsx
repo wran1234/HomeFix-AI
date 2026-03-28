@@ -1,12 +1,14 @@
+import type { Ref } from "react";
 import { VerifyResult } from "../types";
 
 interface Props {
-  videoRef: React.RefObject<HTMLVideoElement>;
+  videoRef: Ref<HTMLVideoElement>;
   result: VerifyResult | null;
   nycContext: string | null;
+  onDone: () => void;
 }
 
-export function VerifyScreen({ videoRef, result, nycContext }: Props) {
+export function VerifyScreen({ videoRef, result, nycContext, onDone }: Props) {
   return (
     <div className="hf-shell">
       <header className="hf-topbar">
@@ -18,7 +20,15 @@ export function VerifyScreen({ videoRef, result, nycContext }: Props) {
       </header>
 
       <div className="hf-camera" style={{ flex: "0 0 48%", minHeight: 200 }}>
-        <video ref={videoRef} autoPlay playsInline muted />
+        <video
+          ref={videoRef}
+          className="hf-camera-feed"
+          autoPlay
+          playsInline
+          muted
+          controls={false}
+          disablePictureInPicture
+        />
         {!result && (
           <div
             style={{
@@ -69,6 +79,12 @@ export function VerifyScreen({ videoRef, result, nycContext }: Props) {
                 <div className="hf-card-nyc__title">Neighborhood context · NYC 311</div>
                 <p className="hf-card-nyc__body">{nycContext}</p>
               </div>
+            )}
+
+            {result.pass && (
+              <button type="button" className="hf-btn-primary" style={{ marginTop: "1.5rem" }} onClick={onDone}>
+                Done — exit session
+              </button>
             )}
           </>
         ) : (

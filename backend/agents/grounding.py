@@ -13,7 +13,8 @@ async def fetch_repair_procedure(issue: str) -> Optional[str]:
     Called once per repair type at the start of the guidance phase.
     Cached in SessionState.grounding_cache for the session duration.
     """
-    client = genai.Client(
+    api_key = os.getenv("GOOGLE_API_KEY", "").strip()
+    client = genai.Client(api_key=api_key) if api_key else genai.Client(
         vertexai=True,
         project=os.getenv("GOOGLE_CLOUD_PROJECT"),
         location=os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1"),
@@ -23,7 +24,7 @@ async def fetch_repair_procedure(issue: str) -> Optional[str]:
 
     try:
         response = await client.aio.models.generate_content(
-            model="gemini-2.0-flash",
+            model="gemini-2.0-flash-001",
             contents=query,
             config=types.GenerateContentConfig(
                 tools=[types.Tool(google_search=types.GoogleSearch())],

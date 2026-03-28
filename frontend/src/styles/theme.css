@@ -77,15 +77,37 @@
   -webkit-font-smoothing: antialiased;
 }
 
-.hf-app-root video.hf-bg-video {
+/* Persistent session video — one element, never remounted */
+.hf-session-video {
   position: absolute;
   inset: 0;
   z-index: 0;
   width: 100%;
   height: 100%;
   object-fit: cover;
+  background: #0a0908;
+  /* WebKit: promote layer so video keeps painting when composited under canvas / blur UI */
+  transform: translateZ(0);
+  -webkit-transform: translateZ(0);
+  -webkit-backface-visibility: hidden;
+  backface-visibility: hidden;
+}
+.hf-session-video--dimmed {
   opacity: 0.22;
   filter: saturate(0.85) contrast(1.05);
+}
+
+/* In-phase camera: sits under CanvasOverlay (WebKit often won’t composite full-bleed video through transparent flex areas) */
+.hf-camera-feed {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  background: #0a0908;
+  transform: translateZ(0);
+  -webkit-transform: translateZ(0);
 }
 
 .hf-start-layer {
@@ -115,6 +137,108 @@
 .hf-reconnect--failed {
   background: linear-gradient(180deg, rgba(184, 71, 64, 0.95), rgba(140, 50, 48, 0.92));
   color: #fff;
+}
+
+.hf-media-warn {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  padding: calc(8px + var(--hf-safe-top)) 14px 8px;
+  background: linear-gradient(180deg, rgba(201, 147, 43, 0.94), rgba(170, 110, 28, 0.9));
+  color: var(--hf-ink);
+  text-align: center;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.35;
+  z-index: 190;
+}
+
+/* Gemini Live on-device diagnostics (~1 Hz from server) */
+.hf-live-debug {
+  position: fixed;
+  left: 8px;
+  right: 8px;
+  bottom: calc(8px + var(--hf-safe-bottom));
+  max-height: 40vh;
+  overflow: auto;
+  z-index: 260;
+  padding: 10px 12px;
+  border-radius: var(--hf-radius-md);
+  background: rgba(13, 12, 11, 0.92);
+  border: 1px solid var(--hf-border-strong);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--hf-text-secondary);
+  -webkit-backdrop-filter: blur(10px);
+  backdrop-filter: blur(10px);
+}
+
+.hf-live-debug--ok {
+  border-color: rgba(74, 140, 108, 0.45);
+}
+
+.hf-live-debug--warn {
+  border-color: rgba(201, 147, 43, 0.55);
+}
+
+.hf-live-debug__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+  font-weight: 600;
+  color: var(--hf-text);
+}
+
+.hf-live-debug__badge {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  padding: 2px 8px;
+  border-radius: var(--hf-radius-pill);
+  background: var(--hf-surface-2);
+  color: var(--hf-accent);
+}
+
+.hf-live-debug__phase {
+  font-size: 10px;
+  color: var(--hf-text-tertiary);
+  font-family: ui-monospace, monospace;
+}
+
+.hf-live-debug__summary {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--hf-text);
+  margin-bottom: 8px;
+}
+
+.hf-live-debug__stats {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.hf-live-debug__age {
+  color: var(--hf-text-tertiary);
+  font-weight: 400;
+}
+
+.hf-live-debug__err {
+  color: var(--hf-danger);
+}
+
+.hf-live-debug__model {
+  font-size: 10px;
+  color: var(--hf-text-tertiary);
+  word-break: break-all;
 }
 
 /* ——— Start ——— */
@@ -181,6 +305,46 @@
   color: var(--hf-text-secondary);
   margin-bottom: 8px;
   letter-spacing: 0.01em;
+}
+
+.hf-media-check {
+  list-style: none;
+  margin: 0 0 16px;
+  padding: 0;
+  font-family: var(--hf-font-ui);
+  font-size: 14px;
+  color: var(--hf-text-secondary);
+  text-align: left;
+  max-width: 320px;
+  align-self: center;
+}
+
+.hf-media-check li {
+  margin-bottom: 6px;
+  padding-left: 1.1em;
+  position: relative;
+}
+
+.hf-media-check li::before {
+  content: "○";
+  position: absolute;
+  left: 0;
+  opacity: 0.65;
+}
+
+.hf-media-check__ok {
+  color: var(--hf-success);
+}
+
+.hf-media-check__ok::before {
+  content: "●";
+  opacity: 1;
+}
+
+.hf-start__fine--hint {
+  margin-top: 12px;
+  max-width: 320px;
+  align-self: center;
 }
 
 .hf-start__fine {
@@ -258,7 +422,9 @@
   flex-direction: column;
   height: 100%;
   min-height: 100%;
-  background: var(--hf-bg);
+  background: transparent;
+  position: relative;
+  z-index: 1;
 }
 
 .hf-topbar {
@@ -271,6 +437,8 @@
   border-bottom: 1px solid var(--hf-border);
   background: rgba(18, 16, 14, 0.92);
   backdrop-filter: blur(12px);
+  position: relative;
+  z-index: 2;
 }
 
 .hf-topbar__brand {
@@ -304,8 +472,10 @@
 .hf-camera {
   flex: 1;
   position: relative;
-  min-height: 0;
-  background: var(--hf-ink);
+  /* iOS Safari: flex:1 + min-height:0 can collapse the camera; keep a real box for <video> */
+  min-height: clamp(220px, 42vh, 520px);
+  background: transparent;
+  isolation: isolate;
 }
 
 .hf-camera video {
@@ -322,6 +492,8 @@
   display: flex;
   flex-direction: column;
   gap: 14px;
+  position: relative;
+  z-index: 2;
 }
 
 .hf-status-line {
@@ -384,7 +556,9 @@
   flex-direction: column;
   height: 100%;
   min-height: 100%;
-  background: var(--hf-bg);
+  background: transparent;
+  position: relative;
+  z-index: 1;
 }
 
 .hf-guide__cam {
@@ -392,8 +566,9 @@
   min-height: 160px;
   flex-shrink: 0;
   position: relative;
-  background: var(--hf-ink);
+  background: transparent;
   overflow: hidden;
+  isolation: isolate;
 }
 
 .hf-guide__cam video {
@@ -404,6 +579,7 @@
 
 .hf-pin-label {
   position: absolute;
+  z-index: 2;
   bottom: 14px;
   left: 50%;
   transform: translateX(-50%);
@@ -428,6 +604,9 @@
   display: flex;
   flex-direction: column;
   gap: 14px;
+  position: relative;
+  z-index: 2;
+  background: var(--hf-bg);
 }
 
 .hf-guide__voice-hint {
@@ -1147,4 +1326,134 @@
   font-size: 11px;
   color: var(--hf-text-tertiary);
   letter-spacing: 0.04em;
+}
+
+/* ── Done screen ─────────────────────────────────────────────────────────── */
+.hf-done {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: 100dvh;
+  padding: 2rem 1.5rem;
+  background: var(--hf-bg);
+  text-align: center;
+}
+
+.hf-done__content {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1rem;
+}
+
+.hf-done__check {
+  width: 72px;
+  height: 72px;
+  border-radius: 50%;
+  background: #2a7a4b;
+  color: #fff;
+  font-size: 2rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 0.5rem;
+}
+
+.hf-done__headline {
+  font-size: 2rem;
+  font-weight: 700;
+  color: var(--hf-text-primary);
+  margin: 0;
+}
+
+.hf-done__message {
+  font-size: 1.125rem;
+  color: var(--hf-text-secondary);
+  max-width: 280px;
+  line-height: 1.5;
+  margin: 0;
+}
+
+.hf-done__issue {
+  font-size: 0.875rem;
+  color: var(--hf-text-tertiary);
+  max-width: 260px;
+  margin: 0;
+}
+
+.hf-done__actions {
+  padding-bottom: 2rem;
+  width: 100%;
+  max-width: 320px;
+}
+
+/* ── Identify screen hint ────────────────────────────────────────────────── */
+.hf-identify__hint {
+  font-size: 12px;
+  color: var(--hf-text-tertiary);
+  text-align: center;
+  margin: 4px 0 0;
+  line-height: 1.4;
+}
+
+/* ── Tools/materials preamble card ──────────────────────────────────────── */
+.hf-tools-card {
+  background: var(--hf-surface);
+  border: 1px solid var(--hf-border);
+  border-radius: 12px;
+  padding: 1rem 1.125rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.hf-tools-card__summary {
+  font-size: 0.875rem;
+  color: var(--hf-text-secondary);
+  margin: 0;
+  line-height: 1.45;
+}
+
+.hf-tools-card__section {
+  display: flex;
+  flex-direction: column;
+  gap: 0.375rem;
+}
+
+.hf-tools-card__label {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--hf-text-tertiary);
+  margin: 0;
+}
+
+.hf-tools-card__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.hf-tools-card__list li {
+  background: var(--hf-bg);
+  border: 1px solid var(--hf-border);
+  border-radius: 20px;
+  padding: 3px 10px;
+  font-size: 13px;
+  color: var(--hf-text-primary);
+}
+
+.hf-tools-card__ready {
+  font-size: 12px;
+  color: var(--hf-accent);
+  font-weight: 500;
+  margin: 0;
+  text-align: center;
 }

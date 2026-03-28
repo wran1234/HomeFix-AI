@@ -1,7 +1,17 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { AppPhase, BBox, SeverityData, StepData, VerifyResult, WSMessage } from "./types";
+import {
+  AppPhase,
+  BBox,
+  LiveDebugSnapshot,
+  SeverityData,
+  StepData,
+  ToolsList,
+  VerifyResult,
+  WSMessage,
+} from "./types";
 import { useWebSocket } from "./hooks/useWebSocket";
 import { useCamera } from "./hooks/useCamera";
+import { useLiveSpeechPlayback } from "./hooks/useLiveSpeechPlayback";
 import { createSessionId } from "./sessionId";
 import { LandingScreen } from "./screens/LandingScreen";
 import { StartScreen } from "./screens/StartScreen";
@@ -9,6 +19,8 @@ import { IdentifyScreen } from "./screens/IdentifyScreen";
 import { GuideScreen } from "./screens/GuideScreen";
 import { VerifyScreen } from "./screens/VerifyScreen";
 import { ProScreen } from "./screens/ProScreen";
+import { DoneScreen } from "./screens/DoneScreen";
+import { LiveDebugPanel } from "./components/LiveDebugPanel";
 
 export default function App() {
   const sessionId = useMemo(() => createSessionId(), []);
@@ -17,55 +29,29 @@ export default function App() {
   const [step, setStep] = useState<StepData | null>(null);
   const [severity, setSeverity] = useState<SeverityData | null>(null);
   const [verifyResult, setVerifyResult] = useState<VerifyResult | null>(null);
+  const [toolsList, setToolsList] = useState<ToolsList | null>(null);
   const [nycChip, setNycChip] = useState<string | null>(null);
   const [nycContext, setNycContext] = useState<string | null>(null);
   const [isSpeaking, setIsSpeaking] = useState(false);
+  const [liveDebug, setLiveDebug] = useState<LiveDebugSnapshot | null>(null);
+  /** Bumps on “Begin session” so the camera runs `.play()` again (fixes black video on prod Safari/WebKit). */
+  const [cameraPlayNonce, setCameraPlayNonce] = useState(0);
 
   const audioCtxRef = useRef<AudioContext | null>(null);
   const sessionActive = phase !== "landing";
   const {
     videoRef,
     error: cameraError,
+    isReady: cameraReady,
+    mediaGate,
+    assertMediaReady,
     startCapture,
     stopCapture,
     startLiveAudio,
     stopLiveAudio,
-  } = useCamera(sessionActive);
+  } = useCamera(sessionActive, cameraPlayNonce, audioCtxRef, phase);
 
-  // ── Audio playback ──────────────────────────────────────────────────────────
-  const playAudio = useCallback(async (b64: string) => {
-    if (!audioCtxRef.current) return;
-    const ctx = audioCtxRef.current;
-    await ctx.resume(); // Safari unlock
-
-    const raw = atob(b64);
-    const buf = new Uint8Array(raw.length);
-    for (let i = 0; i < raw.length; i++) buf[i] = raw.charCodeAt(i);
-
-    try {
-      const audioBuf = await ctx.decodeAudioData(buf.buffer);
-      const source = ctx.createBufferSource();
-      source.buffer = audioBuf;
-      source.connect(ctx.destination);
-      source.start();
-      setIsSpeaking(true);
-      source.onended = () => setIsSpeaking(false);
-    } catch {
-      // PCM raw data — handle as linear16
-      // Gemini Live sends 16-bit PCM at 24kHz
-      const pcm = new Int16Array(buf.buffer);
-      const float32 = new Float32Array(pcm.length);
-      for (let i = 0; i < pcm.length; i++) float32[i] = pcm[i] / 32768;
-      const audioBuf = ctx.createBuffer(1, float32.length, 24000);
-      audioBuf.copyToChannel(float32, 0);
-      const source = ctx.createBufferSource();
-      source.buffer = audioBuf;
-      source.connect(ctx.destination);
-      source.start();
-      setIsSpeaking(true);
-      source.onended = () => setIsSpeaking(false);
-    }
-  }, []);
+  const playAudio = useLiveSpeechPlayback(audioCtxRef, setIsSpeaking, phase);
 
   // ── WebSocket message handler ───────────────────────────────────────────────
   const handleMessage = useCallback((msg: WSMessage) => {
@@ -101,6 +87,9 @@ export default function App() {
       case "escalated":
         setSeverity((prev) => prev ? { ...prev, pro_type: msg.pro_type, findings: msg.findings } : null);
         break;
+      case "tools_list":
+        setToolsList({ tools: msg.tools, materials: msg.materials, summary: msg.summary });
+        break;
       case "nyc_chip":
         setNycChip(msg.text);
         break;
@@ -110,8 +99,15 @@ export default function App() {
       case "error":
         console.warn("HomeFix error:", msg.code, msg.message);
         break;
+      case "debug_live":
+        setLiveDebug(msg);
+        break;
     }
   }, [playAudio]);
+
+  useEffect(() => {
+    if (phase === "landing") setLiveDebug(null);
+  }, [phase]);
 
   const { send, connectionBanner } = useWebSocket(sessionId, handleMessage, sessionActive);
 
@@ -122,10 +118,16 @@ export default function App() {
       stopLiveAudio();
       return;
     }
-    startLiveAudio((b64) => {
-      send({ type: "audio", data: b64 });
-    });
-    return () => stopLiveAudio();
+    let cancelled = false;
+    void (async () => {
+      await startLiveAudio((b64) => {
+        if (!cancelled) send({ type: "audio", data: b64 });
+      });
+    })();
+    return () => {
+      cancelled = true;
+      stopLiveAudio();
+    };
   }, [phase, sessionActive, send, startLiveAudio, stopLiveAudio]);
 
   // ── Frame sending ───────────────────────────────────────────────────────────
@@ -142,20 +144,42 @@ export default function App() {
   }, [phase, startCapture, stopCapture, send]);
 
   // ── Session start ───────────────────────────────────────────────────────────
-  const handleStart = useCallback(() => {
-    // Unlock AudioContext on user gesture (Safari requirement)
+  const handleStart = useCallback(async () => {
+    const gate = assertMediaReady();
+    if (!gate.videoOk || !gate.audioOk) {
+      return;
+    }
     if (!audioCtxRef.current) {
       audioCtxRef.current = new AudioContext();
     }
-    audioCtxRef.current.resume();
+    try {
+      await audioCtxRef.current.resume();
+    } catch {
+      /* still try to run session */
+    }
+    send({ type: "ready" });
+    setCameraPlayNonce((n) => n + 1);
     setPhase("identifying");
-  }, []);
+    queueMicrotask(() => {
+      const v = videoRef.current;
+      if (v?.srcObject) void v.play();
+    });
+  }, [assertMediaReady, send, videoRef]);
 
   // ── "Handle myself" override ────────────────────────────────────────────────
   const handleMyselfOverride = useCallback(() => {
     send({ type: "interrupt", text: "I understand the risk. Please guide me anyway." });
     setPhase("loading_guidance");
   }, [send]);
+
+  const showLiveDebugPanel = [
+    "identifying",
+    "loading_guidance",
+    "guiding",
+    "verifying",
+    "verified",
+    "escalate",
+  ].includes(phase);
 
   // ── Render ──────────────────────────────────────────────────────────────────
   return (
@@ -171,15 +195,36 @@ export default function App() {
         </div>
       )}
 
+      {sessionActive && phase !== "start" && mediaGate.warning && (
+        <div className="hf-media-warn" role="status">
+          {mediaGate.warning}
+        </div>
+      )}
+
+      {/* Full-bleed preview only on Start; after Begin, each phase mounts the same ref in .hf-camera (WebKit-safe). */}
+      {sessionActive && phase === "start" && (
+        <video
+          ref={videoRef}
+          autoPlay
+          playsInline
+          muted
+          controls={false}
+          disablePictureInPicture
+          className="hf-session-video hf-session-video--dimmed"
+        />
+      )}
+
       {phase === "landing" && <LandingScreen onTryApp={() => setPhase("start")} />}
 
       {phase === "start" && (
-        <>
-          <video ref={videoRef} autoPlay playsInline muted className="hf-bg-video" />
-          <div className="hf-start-layer">
-            <StartScreen onStart={handleStart} cameraError={cameraError} />
-          </div>
-        </>
+        <div className="hf-start-layer">
+          <StartScreen
+            onStart={handleStart}
+            cameraError={cameraError}
+            cameraReady={cameraReady}
+            mediaGate={mediaGate}
+          />
+        </div>
       )}
 
       {(phase === "identifying" || phase === "loading_guidance") && (
@@ -197,6 +242,7 @@ export default function App() {
           videoRef={videoRef}
           bbox={bbox}
           step={step}
+          toolsList={toolsList}
           onInterrupt={(text) => send({ type: "interrupt", text })}
         />
       )}
@@ -206,6 +252,23 @@ export default function App() {
           videoRef={videoRef}
           result={verifyResult}
           nycContext={nycContext}
+          onDone={() => setPhase("done")}
+        />
+      )}
+
+      {phase === "done" && (
+        <DoneScreen
+          issue={severity?.issue ?? null}
+          onRestart={() => {
+            setPhase("landing");
+            setSeverity(null);
+            setStep(null);
+            setVerifyResult(null);
+            setBbox(null);
+            setToolsList(null);
+            setNycChip(null);
+            setNycContext(null);
+          }}
         />
       )}
 
@@ -215,6 +278,8 @@ export default function App() {
           onHandleMyself={handleMyselfOverride}
         />
       )}
+
+      {showLiveDebugPanel && <LiveDebugPanel data={liveDebug} />}
     </div>
   );
 }

@@ -3,6 +3,7 @@ import { WSMessage } from "../types";
 
 const MAX_RETRIES = 3;
 const BACKOFF_BASE_MS = 1000;
+const MAX_PENDING_SEND = 100;
 /** Only surface UI after disconnect persists this long (filters brief glitches). */
 const BANNER_AFTER_MS = 2800;
 
@@ -20,6 +21,7 @@ export function useWebSocket(
   enabled: boolean = true
 ): UseWebSocketReturn {
   const wsRef = useRef<WebSocket | null>(null);
+  const pendingSendRef = useRef<string[]>([]);
   const retriesRef = useRef(0);
   const enabledRef = useRef(enabled);
   const bannerTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -28,6 +30,15 @@ export function useWebSocket(
   const onMessageRef = useRef(onMessage);
   onMessageRef.current = onMessage;
   enabledRef.current = enabled;
+
+  const flushPending = useCallback((ws: WebSocket) => {
+    if (ws.readyState !== WebSocket.OPEN) return;
+    const q = pendingSendRef.current;
+    while (q.length) {
+      const next = q.shift();
+      if (next !== undefined) ws.send(next);
+    }
+  }, []);
 
   const clearBannerTimer = useCallback(() => {
     if (bannerTimerRef.current !== null) {
@@ -59,6 +70,7 @@ export function useWebSocket(
       setIsConnected(true);
       setConnectionBanner(null);
       retriesRef.current = 0;
+      flushPending(ws);
 
       if ("geolocation" in navigator) {
         navigator.geolocation.getCurrentPosition(
@@ -95,6 +107,7 @@ export function useWebSocket(
 
     ws.onclose = () => {
       setIsConnected(false);
+      pendingSendRef.current = [];
       if (!enabledRef.current) return;
 
       const willRetry = retriesRef.current < MAX_RETRIES;
@@ -113,12 +126,13 @@ export function useWebSocket(
     ws.onerror = () => {
       ws.close();
     };
-  }, [sessionId, clearBannerTimer, scheduleShowRecoveringBanner]);
+  }, [sessionId, clearBannerTimer, scheduleShowRecoveringBanner, flushPending]);
 
   useEffect(() => {
     if (!enabled) {
       clearBannerTimer();
       retriesRef.current = MAX_RETRIES;
+      pendingSendRef.current = [];
       wsRef.current?.close();
       wsRef.current = null;
       setIsConnected(false);
@@ -137,9 +151,15 @@ export function useWebSocket(
   }, [connect, enabled, clearBannerTimer]);
 
   const send = useCallback((msg: object) => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify(msg));
+    const raw = JSON.stringify(msg);
+    const ws = wsRef.current;
+    if (ws?.readyState === WebSocket.OPEN) {
+      ws.send(raw);
+      return;
     }
+    const q = pendingSendRef.current;
+    q.push(raw);
+    while (q.length > MAX_PENDING_SEND) q.shift();
   }, []);
 
   return { send, isConnected, connectionBanner };

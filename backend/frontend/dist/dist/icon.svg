@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="HomeFix">
+  <rect width="512" height="512" rx="96" fill="#12100e"/>
+  <path fill="none" stroke="#c45c26" stroke-width="36" stroke-linecap="round" stroke-linejoin="round"
+    d="M156 280v120h200V280M256 120v92M200 176l56-56 56 56"/>
+  <circle cx="256" cy="352" r="28" fill="#c45c26"/>
+</svg>
