@@ -51,7 +51,7 @@ async def _wait_for_client_ready(queue: asyncio.Queue) -> None:
             deferred.append(msg)
 
 # Multimodal Live: JPEG frames + 16 kHz mic PCM in; native audio (+ tool JSON) out.
-GEMINI_LIVE_MODEL = "gemini-2.0-flash-live-001"
+GEMINI_LIVE_MODEL = "gemini-2.5-flash-native-audio-latest"
 GEMINI_MODEL = "gemini-2.0-flash-001"
 BBOX_HISTORY_MAX = 5
 MIC_PCM_MIME = "audio/pcm;rate=16000"
@@ -59,7 +59,7 @@ MIC_PCM_MIME = "audio/pcm;rate=16000"
 
 def _live_config(*, system_instruction: str, tools: list[types.Tool] | None = None) -> types.LiveConnectConfig:
     return types.LiveConnectConfig(
-        response_modalities=["AUDIO", "TEXT"],
+        response_modalities=["AUDIO"],
         system_instruction=system_instruction,
         tools=tools,
     )
@@ -456,9 +456,8 @@ async def _run_vision_phase(
     state.live_debug.bridge_label = "vision_identify"
 
     async def _run(live_session) -> None:
-        await live_session.send_client_content(
-            turns=_text_turn("Start now: greet the user warmly and ask them to show you the problem area."),
-            turn_complete=True,
+        await live_session.send_realtime_input(
+            text="Start now: greet the user warmly and ask them to show you the problem area."
         )
         send_task = asyncio.create_task(_feed_frames(queue, live_session, state, fps=1))
         try:
@@ -539,7 +538,7 @@ async def _run_guidance_phase(
             f"Safety context: {json.dumps(state.severity_json)}. "
             f"Start by listing all tools and materials needed using emit_tools_list, then wait for them to say ready."
         )
-        await live.send_client_content(turns=_text_turn(context_msg), turn_complete=True)
+        await live.send_realtime_input(text=context_msg)
 
         send_task = asyncio.create_task(_feed_frames(queue, live, state, fps=1))  # Live API max is 1fps
         try:
@@ -621,9 +620,8 @@ async def _run_verification_phase(
                             _live_debug_note_gemini_send_err(state, e)
                         frames_sent += 1
                         if frames_sent == 3:
-                            await live.send_client_content(
-                                turns=_text_turn("I've shown you the repair area. Please assess it and call verify_repair."),
-                                turn_complete=True,
+                            await live.send_realtime_input(
+                                text="I've shown you the repair area. Please assess it and call verify_repair."
                             )
                 except asyncio.TimeoutError:
                     break
@@ -671,9 +669,8 @@ async def _run_escalation_phase(
     )
 
     async with _live_session(client, live_config, state) as live:
-        await live.send_client_content(
-            turns=_text_turn(f"Explain why this is unsafe for DIY and call escalate: {state.problem}"),
-            turn_complete=True,
+        await live.send_realtime_input(
+            text=f"Explain why this is unsafe for DIY and call escalate: {state.problem}"
         )
 
         escalated = False
@@ -773,7 +770,7 @@ async def _feed_frames(
             txt = (msg.get("text") or "").strip()
             if txt:
                 try:
-                    await live_session.send_client_content(turns=_text_turn(txt), turn_complete=True)
+                    await live_session.send_realtime_input(text=txt)
                 except Exception:
                     pass
 
