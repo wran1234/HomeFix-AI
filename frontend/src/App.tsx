@@ -109,7 +109,21 @@ export default function App() {
     if (phase === "landing") setLiveDebug(null);
   }, [phase]);
 
-  const { send, connectionBanner } = useWebSocket(sessionId, handleMessage, sessionActive);
+  const { send, connectionBanner, isConnected } = useWebSocket(sessionId, handleMessage, sessionActive);
+
+  // After a WebSocket reconnect the server creates a new session (`saw_ready` resets). Resync `ready`
+  // if the user already passed Begin (common when `ready` was only queued, or consumed on the old socket).
+  const lostConnectionRef = useRef(false);
+  useEffect(() => {
+    if (!isConnected) {
+      lostConnectionRef.current = true;
+      return;
+    }
+    if (!lostConnectionRef.current) return;
+    lostConnectionRef.current = false;
+    const pastStart = sessionActive && phase !== "start";
+    if (pastStart) send({ type: "ready" });
+  }, [isConnected, sessionActive, phase, send]);
 
   // ── Live mic → Gemini (16 kHz PCM chunks) ───────────────────────────────────
   useEffect(() => {
@@ -279,7 +293,8 @@ export default function App() {
         />
       )}
 
-      {showLiveDebugPanel && <LiveDebugPanel data={liveDebug} />}
+      {/* LiveDebugPanel hidden in production — remove comment to re-enable for debugging */}
+      {/* {showLiveDebugPanel && <LiveDebugPanel data={liveDebug} />} */}
     </div>
   );
 }

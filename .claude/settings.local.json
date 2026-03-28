@@ -23,7 +23,9 @@
       "Bash(grep -v \"^$\")",
       "Bash(pip show:*)",
       "Bash(cd:*)",
-      "Bash(npm run:*)"
+      "Bash(npm run:*)",
+      "WebFetch(domain:docs.cloud.google.com)",
+      "WebFetch(domain:ai.google.dev)"
     ]
   }
 }

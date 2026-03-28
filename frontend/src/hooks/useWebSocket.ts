@@ -9,7 +9,7 @@ const BANNER_AFTER_MS = 2800;
 
 export type ConnectionBanner = null | "recovering" | "failed";
 
-interface UseWebSocketReturn {
+export interface UseWebSocketReturn {
   send: (msg: object) => void;
   isConnected: boolean;
   connectionBanner: ConnectionBanner;
@@ -107,10 +107,15 @@ export function useWebSocket(
 
     ws.onclose = () => {
       setIsConnected(false);
-      pendingSendRef.current = [];
-      if (!enabledRef.current) return;
+      if (!enabledRef.current) {
+        pendingSendRef.current = [];
+        return;
+      }
 
       const willRetry = retriesRef.current < MAX_RETRIES;
+      // Keep queued messages (e.g. `ready`) so the next socket can flush them — clearing here
+      // caused "Begin session" with no `saw_ready` after a brief disconnect or slow handshake.
+      if (!willRetry) pendingSendRef.current = [];
 
       if (willRetry) {
         scheduleShowRecoveringBanner();

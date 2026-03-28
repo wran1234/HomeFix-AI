@@ -41,16 +41,16 @@ async def _wait_for_client_ready(queue: asyncio.Queue) -> None:
             queue.put_nowait(msg)
 
 # Multimodal Live: JPEG frames + 16 kHz mic PCM in; native audio (+ tool JSON) out.
-GEMINI_LIVE_MODEL = "gemini-2.5-flash-native-audio-latest"
+GEMINI_LIVE_MODEL = "gemini-3.1-flash-live-preview"
 GEMINI_MODEL = "gemini-2.0-flash-001"
 BBOX_HISTORY_MAX = 5
 MIC_PCM_MIME = "audio/pcm;rate=16000"
 
 
 def _live_config(*, system_instruction: str, tools: list[types.Tool] | None = None) -> types.LiveConnectConfig:
-    # TEXT is required for function/tool signaling on Live; AUDIO for spoken output.
+    # gemini-2.5-flash-native-audio-latest only accepts AUDIO modality; function calling works regardless.
     return types.LiveConnectConfig(
-        response_modalities=["AUDIO", "TEXT"],
+        response_modalities=["AUDIO"],
         system_instruction=system_instruction,
         tools=tools,
     )
@@ -382,6 +382,26 @@ def _text_turn(text: str) -> types.Content:
     return types.Content(parts=[types.Part(text=text)], role="user")
 
 
+def _extract_audio(response) -> bytes | None:
+    """Extract raw PCM audio bytes from a Live API response.
+    The SDK exposes audio via server_content.model_turn.parts[].inline_data.data.
+    Fall back to response.data for older SDK versions.
+    """
+    try:
+        if hasattr(response, "server_content") and response.server_content:
+            sc = response.server_content
+            if hasattr(sc, "model_turn") and sc.model_turn:
+                for part in sc.model_turn.parts:
+                    if hasattr(part, "inline_data") and part.inline_data and part.inline_data.data:
+                        return part.inline_data.data
+    except Exception:
+        pass
+    # Fallback: some SDK versions surface audio directly on response.data
+    if hasattr(response, "data") and response.data:
+        return response.data
+    return None
+
+
 def _parse_function_call(response) -> tuple[str | None, dict, str | None]:
     """Extract function name, args, and call id (for tool responses) from a Live message."""
     try:
@@ -435,9 +455,10 @@ async def _run_vision_phase(
         try:
             while True:
                 async for response in live_session.receive():
-                    if hasattr(response, "data") and response.data:
-                        _live_debug_note_gemini_out_audio(state, len(response.data))
-                        audio_b64 = base64.b64encode(response.data).decode()
+                    audio_bytes = _extract_audio(response)
+                    if audio_bytes:
+                        _live_debug_note_gemini_out_audio(state, len(audio_bytes))
+                        audio_b64 = base64.b64encode(audio_bytes).decode()
                         await _send(websocket, {"type": "speech", "audio": audio_b64})
 
                     fn_name, args, call_id = _parse_function_call(response)
@@ -511,13 +532,14 @@ async def _run_guidance_phase(
         )
         await live.send_client_content(turns=_text_turn(context_msg), turn_complete=True)
 
-        send_task = asyncio.create_task(_feed_frames(queue, live, state, fps=2))
+        send_task = asyncio.create_task(_feed_frames(queue, live, state, fps=1))  # Live API max is 1fps
         try:
             while True:
                 async for response in live.receive():
-                    if hasattr(response, "data") and response.data:
-                        _live_debug_note_gemini_out_audio(state, len(response.data))
-                        audio_b64 = base64.b64encode(response.data).decode()
+                    audio_bytes = _extract_audio(response)
+                    if audio_bytes:
+                        _live_debug_note_gemini_out_audio(state, len(audio_bytes))
+                        audio_b64 = base64.b64encode(audio_bytes).decode()
                         await _send(websocket, {"type": "speech", "audio": audio_b64})
 
                     fn_name, args, call_id = _parse_function_call(response)
@@ -604,8 +626,9 @@ async def _run_verification_phase(
 
         while True:
             async for response in live.receive():
-                if hasattr(response, "data") and response.data:
-                    audio_b64 = base64.b64encode(response.data).decode()
+                audio_bytes = _extract_audio(response)
+                if audio_bytes:
+                    audio_b64 = base64.b64encode(audio_bytes).decode()
                     await _send(websocket, {"type": "speech", "audio": audio_b64})
 
                 fn_name, args, call_id = _parse_function_call(response)
@@ -648,9 +671,10 @@ async def _run_escalation_phase(
         escalated = False
         while not escalated:
             async for response in live.receive():
-                if hasattr(response, "data") and response.data:
-                    _live_debug_note_gemini_out_audio(state, len(response.data))
-                    audio_b64 = base64.b64encode(response.data).decode()
+                audio_bytes = _extract_audio(response)
+                if audio_bytes:
+                    _live_debug_note_gemini_out_audio(state, len(audio_bytes))
+                    audio_b64 = base64.b64encode(audio_bytes).decode()
                     await _send(websocket, {"type": "speech", "audio": audio_b64})
 
                 fn_name, args, call_id = _parse_function_call(response)
