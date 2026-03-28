@@ -1,37 +1,52 @@
 # HomeFix AI
+Author: 
+William Ran - wr2176@nyu.edu
+Selina Liu - liuyiyang903@gmail.com
+
+
 
 > Point. Speak. Fix.
 
-A mobile-first AI home repair assistant that watches your camera, speaks live instructions, annotates the problem area, and verifies the fix — powered by Gemini 2.0 Flash Live API + Google ADK.
+A mobile-first AI home repair assistant: marketing landing with local 311 context, then a live camera session where Gemini **sees**, **speaks**, listens to your **mic**, draws **bbox** overlays, and **verifies** the fix — powered by **Gemini 2.0 Flash Live** (Vertex AI) + Google ADK agents.
 
 ## Architecture
 
 ```
-Mobile Browser (PWA)
-  │  WebSocket (bidirectional)
+Mobile browser (React + Vite PWA)
+  │  WebSocket /ws/{session_id}  (frames, audio chunks, interrupts)
+  │  REST /api/nyc-insights?zip=…  (landing only; 30-day 311 snapshot)
   ▼
-FastAPI Backend (Google Cloud Run)
+FastAPI (backend/)
   │
-  ├── VisionAgent  — 1fps frames → problem identification + severity
-  ├── GuidanceAgent — 2fps frames + Gemini Live audio + bbox JSON annotations
-  ├── VerificationAgent — 3 frames → pass/fail confirmation
-  └── NYC311Agent  — async Socrata API → neighborhood repair context
+  ├── VisionAgent        — 1 fps frames → problem + severity
+  ├── GuidanceAgent      — 2 fps + Live audio in/out + bbox JSON
+  ├── VerificationAgent — sparse frames → pass/fail
+  └── NYC311Agent       — Socrata → chip during session; insights for landing
 ```
 
-## Quick Start
+**Auth / AI:** Gemini is called through **Vertex AI**. The app does **not** use `GOOGLE_API_KEY` for the Live path — set **`GOOGLE_CLOUD_PROJECT`** (see Environment).
+
+## Quick start
 
 ### 1. Backend
+
+Run commands from the **`backend/`** directory (so `main` resolves).
 
 ```bash
 cd backend
 cp .env.example .env
-# Add your GOOGLE_API_KEY to .env
+# Set GOOGLE_CLOUD_PROJECT to your real GCP project ID (not the placeholder).
 
 pip install -r requirements.txt
-uvicorn main:app --reload --port 8080
+uvicorn main:app --reload --host 0.0.0.0 --port 8080
 ```
 
-### 2. Frontend
+- Health: `GET http://localhost:8080/health`
+- NYC landing data: `GET http://localhost:8080/api/nyc-insights?zip=10001`
+
+### 2. Frontend (development)
+
+Vite proxies **`/ws`** → `ws://localhost:8080` and **`/api`** → `http://localhost:8080`, so the React app can stay on port **5173**.
 
 ```bash
 cd frontend
@@ -39,21 +54,65 @@ npm install
 npm run dev
 ```
 
-Open on your **phone** at `http://<your-local-ip>:5173` — mobile camera works best.
+Open on your **phone** at `http://<your-lan-ip>:5173` — camera + mic work best on real devices.
 
-### 3. Run Tests
+### 3. Production-style (single server)
+
+Build the SPA, then serve it from FastAPI:
+
+```bash
+cd frontend && npm run build && cd ../backend
+uvicorn main:app --host 0.0.0.0 --port 8080
+```
+
+Open `http://localhost:8080`. Static files come from `frontend/dist/`; `/ws` and `/health` stay on the same origin.
+
+### Tests
+
+From the **repository root**:
 
 ```bash
 python -m pytest tests/ -v
 ```
 
+Optional Live bbox smoke test:
+
+```bash
+python backend/test_bbox_extraction.py
+```
+
+## User flow
+
+1. **Landing** — HomeFix story, CTA; fetches **`/api/nyc-insights`** for a default ZIP (repair-related 311 volume + top complaint types, rolling **30 days**). **No WebSocket** yet — camera/mic are idle.
+2. **Start** — “Start session” unlocks audio (Safari-friendly) and begins the session.
+3. **Identify** — camera at **1 fps**; you can **speak**; agent responds with **speech** and optional NYC chip from 311.
+4. **Guide** — **2 fps** video + **voice** step-by-step + **annotation** overlay (`bbox` JSON).
+5. **Verify** — agent checks the repair; pass/fail.
+6. **Escalate** — if not DIY-safe, **Pro** screen with maps handoff; optional “handle myself” override sends an **interrupt** over the socket.
+
+Phases that send **microphone** audio to the model: `identifying`, `loading_guidance`, `guiding`, `verifying`. If the browser denies the mic, capture may fall back to **video-only** (check permission settings).
+
+## Realtime protocol (summary)
+
+| Direction | Payload |
+|-----------|---------|
+| Client → server | `{ type: "frame", data: base64 JPEG, ts }` |
+| Client → server | `{ type: "audio", data: base64 }` — **16 kHz mono PCM16** chunks |
+| Client → server | `{ type: "interrupt", text }` — human text (“ask anyway”, step clarifications) |
+| Server → client | `status`, `speech` (audio), `annotation`, `step`, `severity`, `verify_result`, `nyc_*`, `error` |
+
+## Connection UX
+
+If the WebSocket drops, the UI shows a **recovering** banner after a short delay while retries run; if reconnection fails, a **failed** banner asks you to reload. The socket is only opened **after** you leave the landing page (session active).
+
+## PWA / caching
+
+The app registers a service worker (`vite-plugin-pwa`). If you see a **blank or stale UI** after deploy, try **`?fresh=1`** on the URL or clear site data. Workbox is configured so **`/api`** and **`/ws`** are not treated as offline shell routes.
+
 ## Deploy to Google Cloud Run
 
 ```bash
-# Build frontend first
 cd frontend && npm run build && cd ..
-
-# Deploy backend (serves frontend static files too)
 gcloud run deploy homefix-ai \
   --source backend \
   --region us-central1 \
@@ -63,38 +122,23 @@ gcloud run deploy homefix-ai \
   --port 8080
 ```
 
-## Environment Variables
+Add `GOOGLE_CLOUD_LOCATION`, `NYC_APP_TOKEN` in the Cloud Run service if needed.
+
+## Environment variables
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `GOOGLE_CLOUD_PROJECT` | ✅ | GCP project ID (Vertex AI) |
+| `GOOGLE_CLOUD_PROJECT` | ✅ | GCP project ID for Vertex AI (must be set at startup; placeholder values fail fast) |
 | `GOOGLE_CLOUD_LOCATION` | optional | Region (default: `us-central1`) |
-| `NYC_APP_TOKEN` | optional | Socrata app token (increases 311 API rate limits) |
+| `NYC_APP_TOKEN` | optional | [Socrata app token](https://dev.socrata.co.jp/docs/app-tokens/) — higher rate limits for NYC Open Data |
 
-## Models Used (all Gemini)
+## Models (Gemini)
 
-| Component | Model |
-|-----------|-------|
-| Live streaming (Vision/Guidance/Verification) | `gemini-2.0-flash-live-001` |
-| Bbox detection (fallback) | `gemini-2.0-flash` |
-| Repair procedure grounding | `gemini-2.0-flash` + Google Search |
+| Area | Model |
+|------|--------|
+| Live streaming (vision / guidance / verification loop) | `gemini-2.0-flash-live-001` |
+| Bbox fallback / grounding | `gemini-2.0-flash` + Google Search where configured |
 
-## Day 1 Critical Test
+---
 
-Before building the full UI, verify bbox JSON extraction from the Live API:
-
-```python
-# Run this to test bbox extraction from Gemini Live text channel
-python backend/test_bbox_extraction.py
-```
-
-If it returns bbox JSON cleanly → proceed with Layer A (native).
-If not → the fallback (separate `gemini-2.0-flash` call per step) is already implemented.
-
-## Demo Flow
-
-1. **Start** — tap "Start Session", camera opens
-2. **Identify** — point at a leak/crack/outlet; agent speaks what it sees
-3. **Guide** — step-by-step voice + annotation overlay on the component
-4. **Verify** — agent scans repair area; confirms or retries
-5. **Pro Screen** — for HIGH RISK issues: explains why, links to Google Maps for pros
+**Repository layout:** `backend/` (FastAPI, agents, `ws_handler.py`), `frontend/` (React + Vite), `tests/` (pytest against backend modules).

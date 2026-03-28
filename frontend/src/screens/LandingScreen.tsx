@@ -1,15 +1,17 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState, type FormEvent } from "react";
 
 export type NycInsightsPayload = {
   ok: boolean;
   zip: string;
-  /** All 311 requests in ZIP in period (not just top categories). */
+  /** Count of rows matching the query (housing-related when housing_focus). */
   requests_30d: number;
   /** Sum of counts for displayed top categories (for bar scaling). */
   total: number;
   items: { complaint_type: string; count: number }[];
   period_days: number;
   error: string | null;
+  /** When true, counts and categories are filtered to home/building conditions. */
+  housing_focus?: boolean;
 };
 
 function titleCaseComplaint(s: string): string {
@@ -18,6 +20,19 @@ function titleCaseComplaint(s: string): string {
     .split(/\s+/)
     .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
     .join(" ");
+}
+
+function insightsBackendMessage(code: string | null | undefined): string {
+  switch (code) {
+    case "timeout":
+      return "The NYC Open Data service took too long to respond. Try again in a moment.";
+    case "query_failed":
+      return "We couldn’t load live 311 data from NYC Open Data. If you’re on Cloud Run, make sure this revision can reach the public internet, then tap Retry. If it keeps failing, add NYC_APP_TOKEN for higher API limits.";
+    case "sodapy_not_installed":
+      return "Backend dependencies may be incomplete. Run pip install -r backend/requirements.txt from the project and redeploy.";
+    default:
+      return "We couldn’t load live 311 statistics right now. You can retry below; NYC Open Data may be busy or temporarily unavailable.";
+  }
 }
 
 interface Props {
@@ -29,11 +44,13 @@ export function LandingScreen({ onTryApp }: Props) {
   const [data, setData] = useState<NycInsightsPayload | null>(null);
   const [loading, setLoading] = useState(true);
   const [fetchError, setFetchError] = useState<string | null>(null);
+  const [zipHint, setZipHint] = useState<string | null>(null);
 
   const load = useCallback(async (z: string) => {
     const clean = /^\d{5}$/.test(z) ? z : "10001";
     setLoading(true);
     setFetchError(null);
+    setZipHint(null);
     try {
       const res = await fetch(`/api/nyc-insights?zip=${encodeURIComponent(clean)}`);
       if (!res.ok) throw new Error("Could not load neighborhood data.");
@@ -41,7 +58,7 @@ export function LandingScreen({ onTryApp }: Props) {
       setData(json);
       setDraftZip(clean);
     } catch {
-      setFetchError("We couldn’t reach NYC Open Data from here. Figures below are illustrative.");
+      setFetchError("We couldn’t reach NYC Open Data from here. Check your connection or try again.");
       setData({
         ok: false,
         zip: clean,
@@ -50,19 +67,34 @@ export function LandingScreen({ onTryApp }: Props) {
         items: [],
         period_days: 30,
         error: "network",
+        housing_focus: true,
       });
     } finally {
       setLoading(false);
     }
   }, []);
 
+  // Auto-load when the field has five digits (stable ~450ms) so typing or pasting a ZIP always refreshes.
   useEffect(() => {
-    void load("10001");
-  }, [load]);
-
-  const applyZip = () => {
     const z = draftZip.replace(/\D/g, "").slice(0, 5);
-    if (z.length === 5) load(z);
+    if (z.length !== 5) {
+      return;
+    }
+    const handle = window.setTimeout(() => {
+      void load(z);
+    }, 280);
+    return () => window.clearTimeout(handle);
+  }, [draftZip, load]);
+
+  const applyZip = (e?: FormEvent) => {
+    e?.preventDefault();
+    const z = draftZip.replace(/\D/g, "").slice(0, 5);
+    if (z.length !== 5) {
+      setZipHint("Enter a full 5-digit NYC area ZIP code.");
+      return;
+    }
+    setZipHint(null);
+    void load(z);
   };
 
   const maxCount = data?.items?.length ? Math.max(...data.items.map((i) => i.count), 1) : 1;
@@ -142,7 +174,11 @@ export function LandingScreen({ onTryApp }: Props) {
         </div>
 
         <div className="hf-landing__nyc-card">
-          <div className="hf-landing__nyc-toolbar">
+          <form
+            className="hf-landing__nyc-toolbar"
+            onSubmit={applyZip}
+            aria-label="Look up 311 housing-related complaints by ZIP"
+          >
             <label className="hf-landing__zip-label" htmlFor="landing-zip">
               ZIP code
             </label>
@@ -155,15 +191,26 @@ export function LandingScreen({ onTryApp }: Props) {
                 placeholder="10001"
                 maxLength={5}
                 value={draftZip}
-                onChange={(e) => setDraftZip(e.target.value.replace(/\D/g, "").slice(0, 5))}
+                onChange={(e) => {
+                  setZipHint(null);
+                  setDraftZip(e.target.value.replace(/\D/g, "").slice(0, 5));
+                }}
               />
-              <button type="button" className="hf-landing__zip-btn" onClick={applyZip}>
+              <button type="submit" className="hf-landing__zip-btn">
                 Update
               </button>
             </div>
-          </div>
+            {zipHint && (
+              <p className="hf-landing__zip-hint" role="status">
+                {zipHint}
+              </p>
+            )}
+            <p className="hf-landing__zip-microcopy">
+              Results load automatically for a full ZIP. Use a NYC-area code (e.g. 11201, 10458).
+            </p>
+          </form>
 
-          {fetchError && <p className="hf-landing__warn">{fetchError}</p>}
+          {fetchError && <p className="hf-landing__warn hf-landing__warn--below-form">{fetchError}</p>}
 
           {loading && <p className="hf-landing__loading">Loading open data…</p>}
 
@@ -173,20 +220,39 @@ export function LandingScreen({ onTryApp }: Props) {
                 {data.ok && data.requests_30d > 0 ? (
                   <>
                     In the last <strong>{data.period_days} days</strong>,{" "}
-                    <strong>{data.zip}</strong> logged{" "}
-                    <strong>{data.requests_30d.toLocaleString()}</strong> 311 service requests in NYC
-                    Open Data for that ZIP. The bars show the eight most common complaint types—many
-                    are conditions HomeFix can help you address or triage early.
+                    <strong>{data.zip}</strong> had{" "}
+                    <strong>{data.requests_30d.toLocaleString()}</strong>{" "}
+                    {data.housing_focus !== false ? (
+                      <>
+                        <strong>housing-related</strong> 311 service requests (heat, leaks, electrical,
+                        pests, construction, and similar) in NYC Open Data
+                      </>
+                    ) : (
+                      <>311 service requests in NYC Open Data for that ZIP</>
+                    )}
+                    . The bars show the most common complaint types in that slice—useful context for
+                    what neighbors are reporting before problems spread.
                   </>
                 ) : data.ok && data.requests_30d === 0 ? (
                   <>
-                    No 311 requests in <strong>{data.zip}</strong> for this window in Open Data—try a
-                    different ZIP, or check back later.
+                    No matching 311 requests in <strong>{data.zip}</strong> for this window in Open
+                    Data (or none in the housing-related filter). Try another NYC ZIP, or check back
+                    later.
                   </>
                 ) : (
                   <>
-                    Live Open Data wasn’t available. In many NYC ZIP codes, hundreds of 311 requests
-                    arrive each month; fixing issues at home early keeps cases from compounding.
+                    <span className="hf-landing__err-lead">{insightsBackendMessage(data.error)}</span>{" "}
+                    In many NYC ZIP codes, housing-related 311 volume is high; fixing problems at home
+                    early keeps cases from compounding.
+                    <span className="hf-landing__retry-wrap">
+                      <button
+                        type="button"
+                        className="hf-landing__retry-btn"
+                        onClick={() => void load(data.zip)}
+                      >
+                        Retry lookup
+                      </button>
+                    </span>
                   </>
                 )}
               </p>
