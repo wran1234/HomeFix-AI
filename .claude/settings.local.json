@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Skill(office-hours)",
+      "Skill(browse)",
+      "Bash(B=~/.claude/skills/gstack/browse/dist/browse)",
+      "Bash($B goto:*)",
+      "Bash($B screenshot:*)",
+      "Bash(kill 13376)",
+      "Bash(pip install:*)",
+      "Bash(python:*)",
+      "Bash(python3:*)",
+      "Bash(ls /Users/williamran/Desktop/NYCHackathon/*.md)"
+    ]
+  }
+}
