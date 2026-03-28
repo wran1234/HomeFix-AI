@@ -26,6 +26,28 @@ from agents.nyc311 import fetch_311_context
 
 logger = logging.getLogger(__name__)
 
+# ── Memory guardrails (Cloud Run OOM / crash loops) ───────────────────────────
+# Unbounded asyncio.create_task(_fetch_and_send_bbox) each ran generate_content + JPEG decode;
+# rapid tool calls (e.g. many emit_step) spiked RAM and killed small containers.
+BBOX_FETCH_CONCURRENCY = 2
+_bbox_fetch_sem = asyncio.BoundedSemaphore(BBOX_FETCH_CONCURRENCY)
+
+# While waiting for {"type":"ready"}, do not hold arbitrary client frames in RAM forever.
+_MAX_DEFERRED_BEFORE_READY = 48
+
+# Smaller queue = lower worst-case duplicate JSON+JPEG copies per connection (bound × frame size).
+WS_INBOUND_QUEUE_MAX = 128
+LIVE_CONNECT_TIMEOUT_S = 20.0
+BYPASS_LIVE_CONNECT_FOR_DEBUG = os.getenv("BYPASS_LIVE_CONNECT_FOR_DEBUG", "false").lower() == "true"
+
+
+class LiveConnectTimeoutError(Exception):
+    """Raised when opening Gemini Live socket exceeds timeout."""
+
+
+class LiveConnectFailedError(Exception):
+    """Raised when opening Gemini Live socket fails."""
+
 
 async def _wait_for_client_ready(queue: asyncio.Queue) -> None:
     """Block until {"type":"ready"} while preserving early media (Python 3.10–compatible).
@@ -48,10 +70,13 @@ async def _wait_for_client_ready(queue: asyncio.Queue) -> None:
         if t == "location":
             queue.put_nowait(msg)
         elif t in ("frame", "audio", "interrupt"):
+            if len(deferred) >= _MAX_DEFERRED_BEFORE_READY:
+                deferred.pop(0)
+                logger.debug("deferred-before-ready cap: dropped oldest buffered message")
             deferred.append(msg)
 
 # Multimodal Live: JPEG frames + 16 kHz mic PCM in; native audio (+ tool JSON) out.
-GEMINI_LIVE_MODEL = "gemini-2.5-flash-native-audio-latest"
+GEMINI_LIVE_MODEL = "gemini-3.1-flash-live-preview"
 GEMINI_MODEL = "gemini-2.0-flash-001"
 BBOX_HISTORY_MAX = 5
 MIC_PCM_MIME = "audio/pcm;rate=16000"
@@ -69,13 +94,35 @@ def _live_config(*, system_instruction: str, tools: list[types.Tool] | None = No
 async def _live_session(
     client: genai.Client, config: types.LiveConnectConfig, state: session_store.SessionState
 ):
-    state.live_debug.live_socket_open = True
+    connect_ctx = client.aio.live.connect(model=GEMINI_LIVE_MODEL, config=config)
+    exc_type = None
+    exc = None
+    tb = None
+    logger.info("opening Gemini Live session", extra={"model": GEMINI_LIVE_MODEL})
     try:
-        async with client.aio.live.connect(model=GEMINI_LIVE_MODEL, config=config) as live:
-            logger.info("Live session: %s", GEMINI_LIVE_MODEL)
-            yield live
+        live = await asyncio.wait_for(connect_ctx.__aenter__(), timeout=LIVE_CONNECT_TIMEOUT_S)
+    except asyncio.TimeoutError as e:
+        logger.error("Gemini Live connect timeout after %.1fs", LIVE_CONNECT_TIMEOUT_S)
+        raise LiveConnectTimeoutError(f"timed out after {LIVE_CONNECT_TIMEOUT_S:.1f}s") from e
+    except Exception as e:
+        logger.error("Gemini Live connect failed: %s", e)
+        raise LiveConnectFailedError(str(e)) from e
+
+    state.live_debug.live_socket_open = True
+    logger.info("Gemini Live connected", extra={"model": GEMINI_LIVE_MODEL})
+    try:
+        yield live
+    except Exception as e:
+        exc_type = type(e)
+        exc = e
+        tb = e.__traceback__
+        raise
     finally:
         state.live_debug.live_socket_open = False
+        try:
+            await connect_ctx.__aexit__(exc_type, exc, tb)
+        except Exception:
+            pass
 
 
 def _live_debug_touch_client_in(state: session_store.SessionState, msg: dict) -> None:
@@ -217,14 +264,15 @@ def _make_client() -> genai.Client:
 
 async def handle(websocket: WebSocket, session_id: str) -> None:
     await websocket.accept()
+    logger.info("websocket connected", extra={"session_id": session_id})
 
     state = session_store.get_or_create(session_id)
-    raw_queue: asyncio.Queue = asyncio.Queue(maxsize=200)
+    raw_queue: asyncio.Queue = asyncio.Queue(maxsize=WS_INBOUND_QUEUE_MAX)
     stop_debug = asyncio.Event()
 
     bridge_task = asyncio.create_task(_bridge(websocket, state, raw_queue))
     recv_task = asyncio.create_task(_receive_loop(websocket, raw_queue, state))
-    debug_task = asyncio.create_task(_debug_pump(websocket, state, stop_debug))
+    debug_task = asyncio.create_task(_debug_pump(websocket, state, raw_queue, stop_debug))
 
     try:
         done, pending = await asyncio.wait(
@@ -256,7 +304,12 @@ async def handle(websocket: WebSocket, session_id: str) -> None:
         session_store.delete(session_id)
 
 
-async def _debug_pump(websocket: WebSocket, state: session_store.SessionState, stop: asyncio.Event) -> None:
+async def _debug_pump(
+    websocket: WebSocket,
+    state: session_store.SessionState,
+    inbound_queue: asyncio.Queue,
+    stop: asyncio.Event,
+) -> None:
     """Push Live telemetry to the client ~1 Hz for on-device debugging."""
     while not stop.is_set():
         try:
@@ -317,6 +370,9 @@ async def _debug_pump(websocket: WebSocket, state: session_store.SessionState, s
                     "receiving_from_phone": receiving_from_phone,
                     "sending_to_gemini": sending_to_gemini,
                     "receiving_from_gemini": receiving_from_gemini,
+                    "ws_queue_depth": inbound_queue.qsize(),
+                    "ws_queue_max": WS_INBOUND_QUEUE_MAX,
+                    "bbox_fetch_concurrency_cap": BBOX_FETCH_CONCURRENCY,
                     "summary": " · ".join(summary_parts),
                 },
             )
@@ -339,39 +395,76 @@ async def _bridge(
     state: session_store.SessionState,
     queue: asyncio.Queue,
 ) -> None:
+    # Signal the UI before any Vertex/client work — genai.Client() can block on first use;
+    # delaying agent_ready left users stuck on "Connecting to AI…".
+    await _send(websocket, {"type": "agent_ready"})
+    state.live_debug.bridge_label = "waiting_ready"
+    logger.info("agent_ready sent")
+
     client = _make_client()
 
-    # Build vision config immediately so we can open the Live socket NOW,
-    # in parallel with waiting for the user to tap "Begin session".
-    # This removes ~1-2 s of Gemini session startup from the perceived latency.
-    nyc_context = state.nyc_context or ""
-    vision_system_prompt = VISION_SYSTEM_PROMPT.replace("{nyc_context}", nyc_context)
-    vision_config = _live_config(
-        system_instruction=vision_system_prompt,
-        tools=[types.Tool(function_declarations=[IDENTIFY_TOOL])],
-    )
-
-    state.live_debug.bridge_label = "connecting_live+waiting_ready"
-    logger.info("Pre-connecting Gemini Live while waiting for client ready signal...")
+    # We do NOT open Gemini Live until {"type":"ready"} — avoids extra concurrent Live sockets.
+    logger.info("waiting for ready")
 
     try:
-        async with _live_session(client, vision_config, state) as live:
-            # Wait for user to tap "Begin session" (AudioContext gesture) —
-            # but the Gemini WebSocket is already open.
-            try:
-                await asyncio.wait_for(_wait_for_client_ready(queue), timeout=60.0)
-            except asyncio.TimeoutError:
-                logger.warning("No ready signal within 60s — proceeding anyway")
+        await asyncio.wait_for(_wait_for_client_ready(queue), timeout=120.0)
+    except asyncio.TimeoutError:
+        logger.warning("ready timeout path", extra={"timeout_s": 120})
+        await _send(
+            websocket,
+            {
+                "type": "error",
+                "code": "READY_TIMEOUT",
+                "message": "Begin session was not received in time. Please tap Begin session again.",
+            },
+        )
+        return
 
-            logger.info("Client ready — greeting immediately (Live session already open)")
-            await _send(websocket, {"type": "status", "state": "identifying"})
-
-            # Vision phase reuses the already-open Live session
-            await _run_vision_phase(client, websocket, state, queue, live=live)
-    except Exception as e:
-        logger.warning("Pre-warmed session failed (%s) — opening fresh session", e)
+    logger.info("ready received")
+    if BYPASS_LIVE_CONNECT_FOR_DEBUG:
+        logger.warning("BYPASS_LIVE_CONNECT_FOR_DEBUG enabled — skipping Gemini connect")
         await _send(websocket, {"type": "status", "state": "identifying"})
-        await _run_vision_phase(client, websocket, state, queue)  # opens its own session
+        logger.info("identifying status sent (bypass)")
+        return
+
+    logger.info("opening Gemini Live session")
+    try:
+        await _send(websocket, {"type": "status", "state": "identifying"})
+        logger.info("identifying status sent")
+        await _run_vision_phase(client, websocket, state, queue)
+    except LiveConnectTimeoutError:
+        logger.exception("LIVE_CONNECT_TIMEOUT path")
+        await _send(
+            websocket,
+            {
+                "type": "error",
+                "code": "LIVE_CONNECT_TIMEOUT",
+                "message": "Timed out while connecting to AI",
+            },
+        )
+        return
+    except LiveConnectFailedError as e:
+        logger.exception("LIVE_CONNECT_FAILED path")
+        await _send(
+            websocket,
+            {
+                "type": "error",
+                "code": "LIVE_CONNECT_FAILED",
+                "message": str(e),
+            },
+        )
+        return
+    except Exception as e:
+        logger.exception("Unexpected startup exception")
+        await _send(
+            websocket,
+            {
+                "type": "error",
+                "code": "LIVE_CONNECT_FAILED",
+                "message": str(e),
+            },
+        )
+        return
 
     # Remaining phases each open their own session (config/tools differ per phase)
     while True:
@@ -719,24 +812,25 @@ async def _fetch_and_send_bbox(
 ) -> None:
     if not component or not state.bbox_history:
         return
-    try:
-        response = await client.aio.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=[
-                types.Part.from_bytes(data=base64.b64decode(state.bbox_history[-1]), mime_type="image/jpeg"),
-                types.Part(text=(
-                    f"Locate '{component}' in this image. "
-                    f'Return ONLY this JSON: {{"bbox": [x, y, width, height], "label": "{component}"}} '
-                    f"where coordinates are 0-1 normalized. If not visible: {{\"bbox\": null}}"
-                )),
-            ],
-            config=types.GenerateContentConfig(temperature=0.0),
-        )
-        parsed = _try_parse_json(response.text or "")
-        if parsed and parsed.get("bbox"):
-            await _send(websocket, {"type": "annotation", "bbox": parsed["bbox"], "label": component, "color": "white"})
-    except Exception:
-        pass
+    async with _bbox_fetch_sem:
+        try:
+            response = await client.aio.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=[
+                    types.Part.from_bytes(data=base64.b64decode(state.bbox_history[-1]), mime_type="image/jpeg"),
+                    types.Part(text=(
+                        f"Locate '{component}' in this image. "
+                        f'Return ONLY this JSON: {{"bbox": [x, y, width, height], "label": "{component}"}} '
+                        f"where coordinates are 0-1 normalized. If not visible: {{\"bbox\": null}}"
+                    )),
+                ],
+                config=types.GenerateContentConfig(temperature=0.0),
+            )
+            parsed = _try_parse_json(response.text or "")
+            if parsed and parsed.get("bbox"):
+                await _send(websocket, {"type": "annotation", "bbox": parsed["bbox"], "label": component, "color": "white"})
+        except Exception:
+            pass
 
 
 async def _feed_frames(

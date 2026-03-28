@@ -5,11 +5,23 @@ interface Props {
   cameraError: string | null;
   cameraReady: boolean;
   mediaGate: MediaGateStatus;
+  /** WebSocket to backend is open — safe to send `ready` (may be queued if still handshaking). */
+  socketConnected: boolean;
+  startupError: string | null;
+  startRequested: boolean;
 }
 
-export function StartScreen({ onStart, cameraError, cameraReady, mediaGate }: Props) {
-  const canBegin =
-    !cameraError && cameraReady && mediaGate.videoOk && mediaGate.audioOk;
+export function StartScreen({
+  onStart,
+  cameraError,
+  cameraReady,
+  mediaGate,
+  socketConnected,
+  startupError,
+  startRequested,
+}: Props) {
+  const mediaOk = !cameraError && cameraReady && mediaGate.videoOk && mediaGate.audioOk;
+  const canBegin = mediaOk && socketConnected;
   return (
     <div className="hf-start">
       <div className="hf-start__glow">
@@ -27,9 +39,9 @@ export function StartScreen({ onStart, cameraError, cameraReady, mediaGate }: Pr
           Point your camera at the issue. You’ll get spoken steps, clear visuals, and a quick quality check when you’re done.
         </p>
 
-        {cameraError ? (
+        {cameraError || startupError ? (
           <div className="hf-error" role="alert">
-            {cameraError}
+            {cameraError ?? startupError}
           </div>
         ) : (
           <>
@@ -41,12 +53,16 @@ export function StartScreen({ onStart, cameraError, cameraReady, mediaGate }: Pr
                 Microphone: {mediaGate.audioOk ? "on" : cameraReady ? "off or blocked" : "starting…"}
               </li>
             </ul>
-            <button type="button" className="hf-btn-primary" onClick={onStart} disabled={!canBegin}>
-              Begin session
+            <button type="button" className="hf-btn-primary" onClick={onStart} disabled={!canBegin || startRequested}>
+              {startRequested ? "Connecting to AI…" : "Begin session"}
             </button>
-            {!canBegin && !cameraError && (
+            {(!canBegin || startRequested) && !cameraError && !startupError && (
               <p className="hf-start__fine hf-start__fine--hint">
-                Allow camera and microphone for this site, then wait until both show &quot;on&quot;.
+                {!mediaOk
+                  ? "Allow camera and microphone for this site, then wait until both show \"on\"."
+                  : !socketConnected
+                    ? "Connecting to the server — button enables when the link is up."
+                    : "Sending start signal to AI…"}
               </p>
             )}
           </>

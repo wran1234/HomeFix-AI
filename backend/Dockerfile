@@ -1,5 +1,8 @@
 FROM python:3.12-slim
 
+# Cloud Run / small VMs: google-genai + concurrent Live + bbox REST needs headroom.
+# If you still see OOM, raise e.g. `gcloud run deploy ... --memory 1Gi` (512Mi is tight under load).
+
 WORKDIR /app
 
 COPY requirements.txt .

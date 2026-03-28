@@ -32,6 +32,8 @@ export default function App() {
   const [nycChip, setNycChip] = useState<string | null>(null);
   const [nycContext, setNycContext] = useState<string | null>(null);
   const [isSpeaking, setIsSpeaking] = useState(false);
+  const [startupError, setStartupError] = useState<string | null>(null);
+  const [startRequested, setStartRequested] = useState(false);
   /** Bumps on “Begin session” so the camera runs `.play()` again (fixes black video on prod Safari/WebKit). */
   const [cameraPlayNonce, setCameraPlayNonce] = useState(0);
 
@@ -53,8 +55,11 @@ export default function App() {
 
   // ── WebSocket message handler ───────────────────────────────────────────────
   const handleMessage = useCallback((msg: WSMessage) => {
+    console.debug("[HomeFix][ws<-]", msg);
     switch (msg.type) {
       case "status":
+        setStartupError(null);
+        setStartRequested(false);
         setPhase(msg.state);
         break;
       case "speech":
@@ -88,6 +93,8 @@ export default function App() {
       case "tools_list":
         setToolsList({ tools: msg.tools, materials: msg.materials, summary: msg.summary });
         break;
+      case "agent_ready":
+        break;
       case "nyc_chip":
         setNycChip(msg.text);
         break;
@@ -96,6 +103,11 @@ export default function App() {
         break;
       case "error":
         console.warn("HomeFix error:", msg.code, msg.message);
+        if (msg.code === "LIVE_CONNECT_TIMEOUT" || msg.code === "LIVE_CONNECT_FAILED" || msg.code === "READY_TIMEOUT") {
+          setStartupError(msg.message);
+          setStartRequested(false);
+          setPhase("start");
+        }
         break;
       case "debug_live":
         break;
@@ -103,6 +115,10 @@ export default function App() {
   }, [playAudio]);
 
   const { send, connectionBanner, isConnected } = useWebSocket(sessionId, handleMessage, sessionActive);
+
+  useEffect(() => {
+    console.info("[HomeFix] phase changed:", phase);
+  }, [phase]);
 
   // After a WebSocket reconnect the server creates a new session (`saw_ready` resets). Resync `ready`
   // if the user already passed Begin (common when `ready` was only queued, or consumed on the old socket).
@@ -115,7 +131,10 @@ export default function App() {
     if (!lostConnectionRef.current) return;
     lostConnectionRef.current = false;
     const pastStart = sessionActive && phase !== "start";
-    if (pastStart) send({ type: "ready" });
+    if (pastStart) {
+      console.info("[HomeFix][ws->] resend ready after reconnect");
+      send({ type: "ready" });
+    }
   }, [isConnected, sessionActive, phase, send]);
 
   // ── Live mic → Gemini (16 kHz PCM chunks) ───────────────────────────────────
@@ -152,9 +171,15 @@ export default function App() {
 
   // ── Session start ───────────────────────────────────────────────────────────
   const handleStart = useCallback(async () => {
+    console.info("[HomeFix] Begin button pressed");
     // Re-check tracks but don't block — mic may not be "live" yet on mobile at the
     // exact moment of tap. We proceed regardless; audio will work once tracks settle.
     assertMediaReady();
+    setStartupError(null);
+    if (!isConnected) {
+      setStartupError("Connection to server is not ready yet. Please wait a moment and try again.");
+      return;
+    }
     if (!audioCtxRef.current) {
       audioCtxRef.current = new AudioContext();
     }
@@ -163,14 +188,20 @@ export default function App() {
     } catch {
       /* still try to run session */
     }
-    send({ type: "ready" });
+    console.info("[HomeFix][ws->] sending ready");
+    const readySent = send({ type: "ready" });
+    if (!readySent) {
+      setStartupError("Could not send start signal to server. Please try again.");
+      return;
+    }
+    setStartRequested(true);
     setCameraPlayNonce((n) => n + 1);
     setPhase("identifying");
     queueMicrotask(() => {
       const v = videoRef.current;
       if (v?.srcObject) void v.play();
     });
-  }, [assertMediaReady, send, videoRef]);
+  }, [assertMediaReady, send, videoRef, isConnected]);
 
   // ── "Handle myself" override ────────────────────────────────────────────────
   const handleMyselfOverride = useCallback(() => {
@@ -211,7 +242,11 @@ export default function App() {
         />
       )}
 
-      {phase === "landing" && <LandingScreen onTryApp={() => setPhase("start")} />}
+      {phase === "landing" && <LandingScreen onTryApp={() => {
+        setStartupError(null);
+        setStartRequested(false);
+        setPhase("start");
+      }} />}
 
       {phase === "start" && (
         <div className="hf-start-layer">
@@ -220,6 +255,9 @@ export default function App() {
             cameraError={cameraError}
             cameraReady={cameraReady}
             mediaGate={mediaGate}
+            socketConnected={isConnected}
+            startupError={startupError}
+            startRequested={startRequested}
           />
         </div>
       )}
@@ -265,6 +303,8 @@ export default function App() {
             setToolsList(null);
             setNycChip(null);
             setNycContext(null);
+            setStartupError(null);
+            setStartRequested(false);
           }}
         />
       )}

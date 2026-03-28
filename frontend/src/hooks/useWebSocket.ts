@@ -10,7 +10,7 @@ const BANNER_AFTER_MS = 2800;
 export type ConnectionBanner = null | "recovering" | "failed";
 
 export interface UseWebSocketReturn {
-  send: (msg: object) => void;
+  send: (msg: object) => boolean;
   isConnected: boolean;
   connectionBanner: ConnectionBanner;
 }
@@ -155,16 +155,17 @@ export function useWebSocket(
     };
   }, [connect, enabled, clearBannerTimer]);
 
-  const send = useCallback((msg: object) => {
+  const send = useCallback((msg: object): boolean => {
     const raw = JSON.stringify(msg);
     const ws = wsRef.current;
     if (ws?.readyState === WebSocket.OPEN) {
       ws.send(raw);
-      return;
+      return true;
     }
     const q = pendingSendRef.current;
     q.push(raw);
     while (q.length > MAX_PENDING_SEND) q.shift();
+    return false;
   }, []);
 
   return { send, isConnected, connectionBanner };

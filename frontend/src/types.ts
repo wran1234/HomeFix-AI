@@ -69,9 +69,14 @@ export interface LiveDebugSnapshot {
   receiving_from_phone: boolean;
   sending_to_gemini: boolean;
   receiving_from_gemini: boolean;
+  /** Inbound WS message queue depth (client→bridge); helps spot backlog / memory pressure. */
+  ws_queue_depth?: number;
+  ws_queue_max?: number;
+  bbox_fetch_concurrency_cap?: number;
   summary: string;
 }
 
+/** Shared WS protocol with backend/ws_handler.py. Keep in sync with server message contracts. */
 export type WSMessage =
   | { type: "status"; state: AppPhase }
   | { type: "speech"; audio: string }
@@ -83,5 +88,6 @@ export type WSMessage =
   | { type: "tools_list"; tools: string[]; materials: string[]; summary: string }
   | { type: "nyc_chip"; text: string }
   | { type: "nyc_context"; text: string }
-  | { type: "error"; code: string; message: string }
+  | { type: "agent_ready" }
+  | { type: "error"; code: "LIVE_CONNECT_TIMEOUT" | "LIVE_CONNECT_FAILED" | "READY_TIMEOUT" | string; message: string }
   | LiveDebugSnapshot;

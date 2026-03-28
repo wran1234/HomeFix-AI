@@ -50,6 +50,10 @@ export function LiveDebugPanel({ data }: Props) {
             <span className="hf-live-debug__age"> (last speech {data.ms_since_gemini_spoke}ms ago)</span>
           )}
         </li>
+        <li>
+          WS queue: {data.ws_queue_depth ?? "—"} / {data.ws_queue_max ?? "—"} · bbox REST cap:{" "}
+          {data.bbox_fetch_concurrency_cap ?? "—"}
+        </li>
         <li className="hf-live-debug__model">Model: {data.model}</li>
         {data.last_upstream_error ? (
           <li className="hf-live-debug__err">Error: {data.last_upstream_error}</li>
