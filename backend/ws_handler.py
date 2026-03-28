@@ -41,16 +41,15 @@ async def _wait_for_client_ready(queue: asyncio.Queue) -> None:
             queue.put_nowait(msg)
 
 # Multimodal Live: JPEG frames + 16 kHz mic PCM in; native audio (+ tool JSON) out.
-GEMINI_LIVE_MODEL = "gemini-3.1-flash-live-preview"
+GEMINI_LIVE_MODEL = "gemini-2.0-flash-live-001"
 GEMINI_MODEL = "gemini-2.0-flash-001"
 BBOX_HISTORY_MAX = 5
 MIC_PCM_MIME = "audio/pcm;rate=16000"
 
 
 def _live_config(*, system_instruction: str, tools: list[types.Tool] | None = None) -> types.LiveConnectConfig:
-    # gemini-2.5-flash-native-audio-latest only accepts AUDIO modality; function calling works regardless.
     return types.LiveConnectConfig(
-        response_modalities=["AUDIO"],
+        response_modalities=["AUDIO", "TEXT"],
         system_instruction=system_instruction,
         tools=tools,
     )
@@ -174,10 +173,10 @@ VERIFY_REPAIR = types.FunctionDeclaration(
     parameters=types.Schema(
         type="OBJECT",
         properties={
-            "pass_": types.Schema(type="BOOLEAN", description="True if repair looks complete"),
+            "repair_passed": types.Schema(type="BOOLEAN", description="True if repair looks complete"),
             "message": types.Schema(type="STRING", description="Specific observation about what you see"),
         },
-        required=["pass_", "message"],
+        required=["repair_passed", "message"],
     ),
 )
 
@@ -634,8 +633,7 @@ async def _run_verification_phase(
                 fn_name, args, call_id = _parse_function_call(response)
                 if fn_name == "verify_repair" and args:
                     await _ack_tool(live, fn_name, call_id)
-                    # "pass_" because "pass" is a Python keyword
-                    result = {"pass": args.get("pass_", False), "message": args.get("message", "")}
+                    result = {"pass": args.get("repair_passed", False), "message": args.get("message", "")}
                     await _send(websocket, {"type": "verify_result", **result})
                     if state.nyc_context:
                         await _send(websocket, {"type": "nyc_context", "text": state.nyc_context})
