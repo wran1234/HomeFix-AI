@@ -9,6 +9,8 @@
 
 A mobile-first AI home repair assistant: marketing landing with local **311** context, then a **live** camera session where Gemini **sees** the feed, **speaks** natively, listens to your **mic**, draws **bbox** overlays, and **verifies** the fix — implemented in **FastAPI** + **google-genai** (optional **Vertex AI** or **API key**), not a separate “ADK” service.
 
+Google Cloud Deploy Link: https://homefix-ai-1079252790790.us-central1.run.app
+
 ## Architecture
 
 ```
