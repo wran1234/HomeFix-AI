@@ -256,6 +256,15 @@ export function useCamera(
       setMediaGate(auditMediaStream(stream));
 
       const actx = sharedAudioContextRef?.current ?? new AudioContext();
+
+      // Resume the context BEFORE connecting nodes — some browsers won't pull
+      // audio from a MediaStreamSource connected to a suspended context.
+      try {
+        await actx.resume();
+      } catch {
+        /* ignore */
+      }
+
       const source = actx.createMediaStreamSource(stream);
       const processor = actx.createScriptProcessor(4096, 1, 1);
       const gain = actx.createGain();
@@ -273,12 +282,6 @@ export function useCamera(
       gain.connect(actx.destination);
 
       audioGraphRef.current = { ctx: actx, source, processor, gain };
-
-      try {
-        await actx.resume();
-      } catch {
-        /* ignore */
-      }
     },
     [stopLiveAudio, sharedAudioContextRef]
   );

@@ -38,6 +38,8 @@ _MAX_DEFERRED_BEFORE_READY = 48
 # Smaller queue = lower worst-case duplicate JSON+JPEG copies per connection (bound × frame size).
 WS_INBOUND_QUEUE_MAX = 128
 LIVE_CONNECT_TIMEOUT_S = 20.0
+# Maximum time to wait for a Gemini Live response before treating the session as stalled.
+LIVE_RECEIVE_TIMEOUT_S = 90.0
 BYPASS_LIVE_CONNECT_FOR_DEBUG = os.getenv("BYPASS_LIVE_CONNECT_FOR_DEBUG", "false").lower() == "true"
 
 
@@ -76,7 +78,7 @@ async def _wait_for_client_ready(queue: asyncio.Queue) -> None:
             deferred.append(msg)
 
 # Multimodal Live: JPEG frames + 16 kHz mic PCM in; native audio (+ tool JSON) out.
-GEMINI_LIVE_MODEL = "gemini-3.1-flash-live-preview"
+GEMINI_LIVE_MODEL = "gemini-2.5-flash-native-audio-latest"
 GEMINI_MODEL = "gemini-2.0-flash-001"
 BBOX_HISTORY_MAX = 5
 MIC_PCM_MIME = "audio/pcm;rate=16000"
@@ -534,8 +536,8 @@ async def _ack_tool(live_session, fn_name: str, call_id: str | None = None) -> N
         else:
             fr = types.FunctionResponse(name=fn_name, response={"result": "ok"})
         await live_session.send_tool_response(function_responses=[fr])
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("_ack_tool(%s) failed: %s", fn_name, e)
 
 
 async def _run_vision_phase(
@@ -553,9 +555,11 @@ async def _run_vision_phase(
             text="Start now: greet the user warmly and ask them to show you the problem area."
         )
         send_task = asyncio.create_task(_feed_frames(queue, live_session, state, fps=1))
+        last_activity = time.monotonic()
         try:
             while True:
                 async for response in live_session.receive():
+                    last_activity = time.monotonic()
                     audio_bytes = _extract_audio(response)
                     if audio_bytes:
                         _live_debug_note_gemini_out_audio(state, len(audio_bytes))
@@ -587,6 +591,12 @@ async def _run_vision_phase(
                         return
 
                     await _process_location_from_queue(queue, state, websocket)
+
+                # receive() iterator exhausted — check for stall
+                if time.monotonic() - last_activity > LIVE_RECEIVE_TIMEOUT_S:
+                    logger.error("vision phase: no Gemini activity for %.0fs, aborting", LIVE_RECEIVE_TIMEOUT_S)
+                    await _send(websocket, {"type": "error", "code": "LIVE_STALLED", "message": "AI stopped responding. Please try again."})
+                    return
         finally:
             send_task.cancel()
 
@@ -634,9 +644,11 @@ async def _run_guidance_phase(
         await live.send_realtime_input(text=context_msg)
 
         send_task = asyncio.create_task(_feed_frames(queue, live, state, fps=1))  # Live API max is 1fps
+        last_activity = time.monotonic()
         try:
             while True:
                 async for response in live.receive():
+                    last_activity = time.monotonic()
                     audio_bytes = _extract_audio(response)
                     if audio_bytes:
                         _live_debug_note_gemini_out_audio(state, len(audio_bytes))
@@ -666,6 +678,12 @@ async def _run_guidance_phase(
                         state.active_phase = "verification"
                         await _send(websocket, {"type": "status", "state": "verifying"})
                         return
+
+                # receive() iterator exhausted — check for stall
+                if time.monotonic() - last_activity > LIVE_RECEIVE_TIMEOUT_S:
+                    logger.error("guidance phase: no Gemini activity for %.0fs, aborting", LIVE_RECEIVE_TIMEOUT_S)
+                    await _send(websocket, {"type": "error", "code": "LIVE_STALLED", "message": "AI stopped responding during guidance. Please try again."})
+                    return
         finally:
             send_task.cancel()
 
@@ -724,8 +742,10 @@ async def _run_verification_phase(
         except asyncio.TimeoutError:
             pass
 
+        last_activity = time.monotonic()
         while True:
             async for response in live.receive():
+                last_activity = time.monotonic()
                 audio_bytes = _extract_audio(response)
                 if audio_bytes:
                     audio_b64 = base64.b64encode(audio_bytes).decode()
@@ -739,6 +759,12 @@ async def _run_verification_phase(
                     if state.nyc_context:
                         await _send(websocket, {"type": "nyc_context", "text": state.nyc_context})
                     return
+
+            # receive() iterator exhausted — check for stall
+            if time.monotonic() - last_activity > LIVE_RECEIVE_TIMEOUT_S:
+                logger.error("verification phase: no Gemini activity for %.0fs, aborting", LIVE_RECEIVE_TIMEOUT_S)
+                await _send(websocket, {"type": "error", "code": "LIVE_STALLED", "message": "AI stopped responding during verification. Please try again."})
+                return
 
 
 async def _run_escalation_phase(
@@ -767,8 +793,10 @@ async def _run_escalation_phase(
         )
 
         escalated = False
+        last_activity = time.monotonic()
         while not escalated:
             async for response in live.receive():
+                last_activity = time.monotonic()
                 audio_bytes = _extract_audio(response)
                 if audio_bytes:
                     _live_debug_note_gemini_out_audio(state, len(audio_bytes))
@@ -783,6 +811,11 @@ async def _run_escalation_phase(
                     await _send(websocket, {"type": "escalated", **args})
                     escalated = True
                     break
+
+            if not escalated and time.monotonic() - last_activity > LIVE_RECEIVE_TIMEOUT_S:
+                logger.error("escalation phase: no Gemini activity for %.0fs, aborting", LIVE_RECEIVE_TIMEOUT_S)
+                await _send(websocket, {"type": "error", "code": "LIVE_STALLED", "message": "AI stopped responding during escalation. Please try again."})
+                return
 
     async def _wait_escalate_interrupt() -> None:
         while True:
@@ -930,8 +963,10 @@ def _try_parse_json(text: str) -> dict | None:
         return None
 
 
-async def _send(websocket: WebSocket, data: dict) -> None:
+async def _send(websocket: WebSocket, data: dict) -> bool:
     try:
         await websocket.send_json(data)
-    except Exception:
-        pass
+        return True
+    except Exception as e:
+        logger.warning("ws send failed (%s): %s", data.get("type", "?"), e)
+        return False
