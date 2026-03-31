@@ -559,11 +559,18 @@ async def _run_vision_phase(
     state.live_debug.bridge_label = "vision_identify"
 
     async def _run(live_session) -> None:
-        await live_session.send_realtime_input(
-            text="Start now: greet the user warmly and ask them to show you the problem area."
-        )
+        logger.info("vision: sending initial prompt")
+        try:
+            await live_session.send_realtime_input(
+                text="Start now: greet the user warmly and ask them to show you the problem area."
+            )
+            logger.info("vision: initial prompt sent OK")
+        except Exception as e:
+            logger.error("vision: initial prompt send FAILED: %s", e)
+            return
         send_task = asyncio.create_task(_feed_frames(queue, live_session, state, fps=1))
         last_activity = time.monotonic()
+        logger.info("vision: entering receive loop")
         try:
             while True:
                 async for response in live_session.receive():
