@@ -1,11 +1,21 @@
 """HomeFix AI — FastAPI backend."""
 
+import logging
 import os
+import sys
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# Ensure all app loggers emit to stdout (Cloud Run captures stdout).
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)s %(name)s: %(message)s",
+    stream=sys.stdout,
+    force=True,
+)
 
 from fastapi import FastAPI, HTTPException, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
