@@ -263,7 +263,10 @@ ESCALATE = types.FunctionDeclaration(
 def _make_client() -> genai.Client:
     api_key = os.getenv("GOOGLE_API_KEY", "").strip()
     if api_key:
+        logger.info("Using API key client (key=%s...)", api_key[:10])
         return genai.Client(api_key=api_key)
+    logger.info("Using Vertex AI client (project=%s, location=%s)",
+                os.getenv("GOOGLE_CLOUD_PROJECT"), os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1"))
     return genai.Client(
         vertexai=True,
         project=os.getenv("GOOGLE_CLOUD_PROJECT"),
