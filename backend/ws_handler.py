@@ -59,6 +59,7 @@ async def _wait_for_client_ready(queue: asyncio.Queue) -> None:
     receives video for the vision phase.
     """
     deferred: list[dict] = []
+    location_msg: dict | None = None
     while True:
         try:
             msg = await asyncio.wait_for(queue.get(), timeout=5.0)
@@ -66,13 +67,17 @@ async def _wait_for_client_ready(queue: asyncio.Queue) -> None:
             logger.info("_wait_for_client_ready: still waiting (qsize=%d, deferred=%d)", queue.qsize(), len(deferred))
             continue
         t = msg.get("type")
-        logger.info("_wait_for_client_ready: got type=%s", t)
         if t == "ready":
+            logger.info("_wait_for_client_ready: got ready")
+            # Re-inject location and deferred media so later phases can use them.
+            if location_msg is not None:
+                queue.put_nowait(location_msg)
             for m in deferred:
                 queue.put_nowait(m)
             break
         if t == "location":
-            queue.put_nowait(msg)
+            # Hold aside — do NOT re-queue or it will spin forever.
+            location_msg = msg
         elif t in ("frame", "audio", "interrupt"):
             if len(deferred) >= _MAX_DEFERRED_BEFORE_READY:
                 deferred.pop(0)
