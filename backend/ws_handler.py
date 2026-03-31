@@ -63,8 +63,10 @@ async def _wait_for_client_ready(queue: asyncio.Queue) -> None:
         try:
             msg = await asyncio.wait_for(queue.get(), timeout=5.0)
         except asyncio.TimeoutError:
+            logger.info("_wait_for_client_ready: still waiting (qsize=%d, deferred=%d)", queue.qsize(), len(deferred))
             continue
         t = msg.get("type")
+        logger.info("_wait_for_client_ready: got type=%s", t)
         if t == "ready":
             for m in deferred:
                 queue.put_nowait(m)
@@ -386,6 +388,7 @@ async def _receive_loop(websocket: WebSocket, queue: asyncio.Queue, state: sessi
     async for message in websocket.iter_text():
         try:
             data = json.loads(message)
+            logger.info("ws recv: type=%s qsize=%d", data.get("type"), queue.qsize())
             _live_debug_touch_client_in(state, data)
             await queue.put(data)
         except json.JSONDecodeError:
