@@ -85,7 +85,7 @@ async def _wait_for_client_ready(queue: asyncio.Queue) -> None:
             deferred.append(msg)
 
 # Multimodal Live: JPEG frames + 16 kHz mic PCM in; native audio (+ tool JSON) out.
-GEMINI_LIVE_MODEL = "gemini-2.5-flash-native-audio-latest"
+GEMINI_LIVE_MODEL = "gemini-live-2.5-flash-native-audio"
 GEMINI_MODEL = "gemini-2.0-flash-001"
 BBOX_HISTORY_MAX = 5
 MIC_PCM_MIME = "audio/pcm;rate=16000"
